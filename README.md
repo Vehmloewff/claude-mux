@@ -21,6 +21,52 @@ Requires Rust, Zig 0.15 (`brew install zig@0.15`) and Claude Code on `PATH`.
 make install     # cargo install with the macOS SDK workaround applied
 ```
 
+### Nix
+
+The flake provides `packages.<system>.default` (both binaries), an overlay,
+and modules that run `claudexd` as a systemd user service. It also has a
+`devShells.default`. The Ghostty source and its Zig dependencies are pinned
+as flake inputs, so the build needs no network access.
+
+NixOS (the service runs for every user who logs in):
+
+```nix
+{
+  inputs.claudex.url = "github:Vehmloewff/claudex";
+
+  outputs = { nixpkgs, claudex, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      modules = [
+        claudex.nixosModules.default
+        ({ pkgs, ... }: {
+          services.claudexd.enable = true;
+          # claude and anything sessions need, unless already in the user profile
+          services.claudexd.extraPackages = [ pkgs.claude-code pkgs.git ];
+        })
+      ];
+    };
+  };
+}
+```
+
+Home Manager (Linux):
+
+```nix
+{
+  imports = [ claudex.homeManagerModules.default ];
+  services.claudexd.enable = true;
+  services.claudexd.extraPackages = [ pkgs.claude-code pkgs.git ];
+}
+```
+
+Options: `enable`, `package`, `extraPackages` (put on the service's `PATH`
+ahead of the user and system profiles) and `environment` (e.g.
+`CLAUDEX_CLAUDE_BIN`). The unit uses `KillMode=mixed`, so on
+`systemctl --user stop claudexd` only the daemon gets `SIGTERM`. It then
+stops its claude sessions itself and records them as `stopped`, so
+`claudex resume` can pick them back up. Logs go to
+`journalctl --user -u claudexd`.
+
 Use `make build` / `make test` for development. The Makefile puts
 `tools/xcrun-shim` on `PATH`. The shim is needed because Zig 0.15's bundled
 libc++ can't compile against the macOS 27 SDK headers, so it points the

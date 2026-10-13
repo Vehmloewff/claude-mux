@@ -98,6 +98,19 @@ pub fn run() -> Result<()> {
         let d = daemon.clone();
         std::thread::spawn(move || ticker(d));
     }
+    {
+        // SIGTERM (e.g. `systemctl stop`) and SIGINT stop gracefully, leaving
+        // sessions resumable. The handler only sets a flag; this thread acts.
+        let d = daemon.clone();
+        install_signal_handlers();
+        std::thread::spawn(move || {
+            while !STOP_SIGNAL.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            eprintln!("[{}] received stop signal", paths::now());
+            shutdown(&d);
+        });
+    }
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -538,8 +551,26 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     Ok(())
 }
 
+static STOP_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop_signal(_: libc::c_int) {
+    STOP_SIGNAL.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    // Handled (not ignored or blocked) signals reset to their defaults on
+    // exec, so the claude children are unaffected.
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        unsafe {
+            libc::signal(sig, on_stop_signal as *const () as libc::sighandler_t);
+        }
+    }
+}
+
 fn shutdown(d: &Shared) {
-    d.shutting_down.store(true, Ordering::SeqCst);
+    if d.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
     {
         let mut inner = d.lock();
         for s in inner.sessions.values_mut() {
