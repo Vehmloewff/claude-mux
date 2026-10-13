@@ -21,6 +21,8 @@ Requires Rust, Zig 0.15 (`brew install zig@0.15`) and Claude Code on `PATH`.
 make install     # cargo install with the macOS SDK workaround applied
 ```
 
+Then start the daemon (`claudexd &`, or as a service) before using `claudex`.
+
 ### Nix
 
 The flake provides `packages.<system>.default` (both binaries), an overlay,
@@ -118,12 +120,15 @@ directory and age. The right pane shows the selected session's terminal.
 
 ## How it works
 
-- **Daemon.** `claudexd` is a separate binary. The first `claudex` command
-  starts it automatically (it's looked up next to `claudex`, then on `PATH`;
-  run it by hand to watch its logs). It listens
+- **Daemon.** `claudexd` is a separate binary that must be running before
+  `claudex` is used; `claudex` never starts it and errors if it is down. Run
+  it under a service manager (the nix module provides a systemd user unit)
+  or in the background. It listens
   on `~/.claudex/daemon.sock`. It owns every claude process and its PTY.
-  Session records are kept in `~/.claudex/sessions.json`, so sessions survive
-  a daemon restart as `stopped` and can be resumed. Claude Code's own session
+  Session records are kept in a Turso database at `~/.claudex/state.db`, so
+  sessions survive a daemon restart as `stopped` and can be resumed. Its
+  schema is a set of migrations embedded in the binary (`migrations/`), which
+  the daemon applies on startup and records in `_applied_migrations`. Claude Code's own session
   id is fixed with `--session-id`, which lets `resume` use `claude --resume`.
 - **Terminal emulation.** All PTY output is fed into a libghostty-vt
   `Terminal`, one per session, each on its own thread because the handles are
@@ -143,7 +148,7 @@ directory and age. The right pane shows the selected session's terminal.
 - **Sending.** Messages are pasted into claude as a bracketed paste followed
   by Enter, once the session is idle, so each one becomes its own turn.
 
-Environment variables: `CLAUDEX_HOME` sets the state directory,
+Environment variables: `CLAUDEX_HOME` sets the directory holding `state.db`, the log and the socket,
 `CLAUDEX_SOCKET` sets the socket path, `CLAUDEX_CLAUDE_BIN` sets the
 claude binary, and `CLAUDEX_DEBUG=1` makes `claudexd` log every hook payload. Inside a session, `CLAUDEX_SESSION_ID` is set and `claudex` is
 on `PATH`.

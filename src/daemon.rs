@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
 
+use crate::db::Db;
 use crate::hooks;
 use crate::paths;
 use crate::protocol::*;
@@ -72,6 +73,8 @@ struct Inner {
 
 pub struct Daemon {
     inner: Mutex<Inner>,
+    /// Only used with `inner` locked, which serializes writes.
+    db: Db,
     changed: Condvar,
     shutting_down: AtomicBool,
 }
@@ -84,12 +87,15 @@ pub fn run() -> Result<()> {
     if UnixStream::connect(&sock).is_ok() {
         bail!("a claudex daemon is already running at {}", sock.display());
     }
+    let db = Db::open(&paths::db_file())?;
+    let sessions = load_sessions(&db)?;
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     eprintln!("[{}] claudex daemon listening on {}", paths::now(), sock.display());
 
     let daemon: Shared = Arc::new(Daemon {
-        inner: Mutex::new(Inner { sessions: load_sessions(), version: 1 }),
+        inner: Mutex::new(Inner { sessions, version: 1 }),
+        db,
         changed: Condvar::new(),
         shutting_down: AtomicBool::new(false),
     });
@@ -124,11 +130,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn load_sessions() -> BTreeMap<String, Session> {
+fn load_sessions(db: &Db) -> Result<BTreeMap<String, Session>> {
     let mut map = BTreeMap::new();
-    let Ok(data) = std::fs::read_to_string(paths::sessions_file()) else { return map };
-    let Ok(infos) = serde_json::from_str::<Vec<SessionInfo>>(&data) else { return map };
-    for mut info in infos {
+    for mut info in db.load_sessions().context("load sessions")? {
         if info.status.is_live() {
             info.status = Status::Stopped;
             info.status_detail = Some("daemon restarted; resume to continue".into());
@@ -153,7 +157,7 @@ fn load_sessions() -> BTreeMap<String, Session> {
             },
         );
     }
-    map
+    Ok(map)
 }
 
 impl Daemon {
@@ -164,12 +168,8 @@ impl Daemon {
     /// Record that session info changed: persist and wake watchers.
     fn touch(&self, inner: &mut Inner) {
         inner.version += 1;
-        let infos: Vec<&SessionInfo> = inner.sessions.values().map(|s| &s.info).collect();
-        if let Ok(json) = serde_json::to_vec_pretty(&infos) {
-            let tmp = paths::sessions_file().with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, paths::sessions_file());
-            }
+        if let Err(e) = self.db.save_sessions(inner.sessions.values().map(|s| &s.info)) {
+            eprintln!("[{}] failed to save sessions: {e:#}", paths::now());
         }
         self.changed.notify_all();
     }

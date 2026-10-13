@@ -26,8 +26,8 @@ pub fn socket() -> PathBuf {
     PathBuf::from(format!("/tmp/claudex-{uid}-{:012x}.sock", h.finish() & 0xffff_ffff_ffff))
 }
 
-pub fn sessions_file() -> PathBuf {
-    home().join("sessions.json")
+pub fn db_file() -> PathBuf {
+    home().join("state.db")
 }
 
 pub fn log_file() -> PathBuf {

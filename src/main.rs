@@ -13,8 +13,8 @@ use claudex::{ago, client, hooks, manage, short_path};
     version,
     about = "Run and manage many Claude Code sessions from one place",
     long_about = "Run and manage many Claude Code sessions from one place.\n\n\
-Each session is an interactive `claude` running in the claudexd daemon (started \
-on demand). People, scripts and other Claude sessions can create sessions, send \
+Each session is an interactive `claude` running in the claudexd daemon, which \
+must already be running. People, scripts and other Claude sessions can create sessions, send \
 them work and wait for results; `claudex manage` shows every session live.",
     after_help = "Run `claudex --help` for the workflow, session states, exit codes and environment.",
     after_long_help = AFTER_HELP
@@ -61,7 +61,7 @@ NOTES
   is on PATH and CLAUDEX_SESSION_ID holds the session's own id.
 
 ENVIRONMENT
-  CLAUDEX_HOME        state directory (default ~/.claudex)
+  CLAUDEX_HOME        holds state.db, daemon.log, daemon.sock (default ~/.claudex)
   CLAUDEX_SOCKET      daemon socket path (default $CLAUDEX_HOME/daemon.sock)
   CLAUDEX_CLAUDE_BIN  claude executable (default `claude` on PATH)";
 

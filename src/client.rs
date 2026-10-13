@@ -1,12 +1,9 @@
-//! Client side of the daemon socket, including daemon auto-start.
+//! Client side of the daemon socket.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::paths;
 use crate::protocol::{Request, Response};
@@ -47,52 +44,19 @@ fn try_connect() -> Option<Conn> {
     Some(Conn { reader: BufReader::new(stream), writer })
 }
 
-/// Connect to the daemon, starting it in the background if needed.
+/// Connect to the daemon, failing if it isn't running.
 pub fn connect() -> Result<Conn> {
-    if let Some(conn) = try_connect() {
-        return Ok(conn);
-    }
-    spawn_daemon()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Some(conn) = try_connect() {
-            return Ok(conn);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!(
-        "could not reach the claudex daemon at {} (see {})",
-        paths::socket().display(),
-        paths::log_file().display()
-    )
+    try_connect().ok_or_else(|| {
+        anyhow!(
+            "the claudex daemon is not running at {} (start it with `claudexd`)",
+            paths::socket().display()
+        )
+    })
 }
 
 /// Connect only if a daemon is already running.
 pub fn connect_existing() -> Option<Conn> {
     try_connect()
-}
-
-fn spawn_daemon() -> Result<()> {
-    std::fs::create_dir_all(paths::home())?;
-    let exe = paths::sibling_exe("claudexd");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths::log_file())?;
-    let mut cmd = Command::new(&exe);
-    cmd.stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    // Detach from the caller's session so the daemon outlives the terminal.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn()
-        .with_context(|| format!("failed to start {} (is claudexd installed?)", exe.display()))?;
-    Ok(())
 }
 
 /// Send one request and read one response.
