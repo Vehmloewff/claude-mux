@@ -2,3 +2,5 @@
 //!
 //! Shared by the `claudex` CLI and the `claudexd` daemon.
 
+pub mod paths;
+pub mod protocol;
