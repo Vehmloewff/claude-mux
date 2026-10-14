@@ -3,7 +3,7 @@
   stdenv,
   rustPlatform,
   callPackage,
-  zig_0_15,
+  zig_0_16,
   darwin,
   xcbuild,
   ghostty-src,
@@ -28,12 +28,15 @@ rustPlatform.buildRustPackage {
     ];
   };
 
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    outputHashes."libghostty-vt-0.2.1" = "sha256-XepsHhhauHZnaz8ZpWNaas/7sI/22VoH7b3+0dP4NJk=";
+  };
 
   # Zig is only invoked by the libghostty-vt-sys build script; keep its setup
   # hook from taking over the build/check/install phases.
   nativeBuildInputs = [
-    zig_0_15
+    zig_0_16
   ]
   # Zig locates the macOS SDK through xcrun, as in Ghostty's own Nix build.
   ++ lib.optionals stdenv.hostPlatform.isDarwin [

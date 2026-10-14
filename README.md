@@ -15,10 +15,10 @@ claudex manage                                                             # the
 
 ## Install
 
-Requires Rust, Zig 0.15 (`brew install zig@0.15`) and Claude Code on `PATH`.
+Requires Rust, Zig 0.16 (`brew install zig@0.16`) and Claude Code on `PATH`.
 
 ```sh
-make install     # cargo install with the macOS SDK workaround applied
+cargo install --path . --locked
 ```
 
 There's nothing else to set up: the first `claudex` command that needs the
@@ -37,11 +37,6 @@ nix profile install github:Vehmloewff/claudex
 ```
 
 No service module is needed, since `claudexd` starts on demand.
-
-Use `make build` / `make test` for development. The Makefile puts
-`tools/xcrun-shim` on `PATH`. The shim is needed because Zig 0.15's bundled
-libc++ can't compile against the macOS 27 SDK headers, so it points the
-libghostty build at an older installed SDK. On other systems it does nothing.
 
 Everything an agent needs to drive claudex is in `claudex --help`.
 

@@ -5,7 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Must match GHOSTTY_COMMIT in the libghostty-vt-sys crate (Cargo.lock).
     ghostty-src = {
-      url = "github:ghostty-org/ghostty/a887df42c56f6de86c0fe6da9c4eeca37931e083";
+      url = "github:ghostty-org/ghostty/3425025e585a3403340d4dc6d65132f42e05e605";
       flake = false;
     };
   };

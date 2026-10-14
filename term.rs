@@ -18,7 +18,7 @@ use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::screen::{CellContentTag, CellWide};
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::terminal::{Mode, ScrollViewport};
-use libghostty_vt::{RenderState, Terminal, TerminalOptions};
+use libghostty_vt::{RenderState, Terminal};
 
 use crate::protocol::{self, CellStyle, Color, KeyCode, KeyInput, Screen, Span};
 
@@ -121,7 +121,8 @@ fn run(
     rx: Receiver<Msg>,
     on_event: impl Fn(TermEvent),
 ) -> anyhow::Result<()> {
-    let mut term = Terminal::new(TerminalOptions { cols, rows, max_scrollback: 10_000 })?;
+    let mut term = Terminal::new(cols, rows)?;
+    term.set_scrollback_max_lines(Some(10_000))?;
     let title_changed = Rc::new(RefCell::new(false));
     {
         let writer = writer.clone();
@@ -659,7 +660,11 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::new()));
         let writer: PtyWriter = Arc::new(Mutex::new(Box::new(Sink(buf.clone()))));
         let emu = Emu {
-            term: Terminal::new(TerminalOptions { cols: 40, rows: 6, max_scrollback: 100 }).unwrap(),
+            term: {
+                let mut term = Terminal::new(40, 6).unwrap();
+                term.set_scrollback_max_lines(Some(100)).unwrap();
+                term
+            },
             render: RenderState::new().unwrap(),
             rows_it: RowIterator::new().unwrap(),
             cells_it: CellIterator::new().unwrap(),
