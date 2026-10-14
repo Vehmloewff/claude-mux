@@ -2,6 +2,18 @@
 name = "claudex"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "claudex"
+path = "main.rs"
+
+[[bin]]
+name = "claudexd"
+path = "claudexd.rs"
 
 [dependencies]
 anyhow = "1.0.104"

@@ -15,7 +15,7 @@ use crate::protocol::{SessionInfo, Status};
 
 /// `(name, sql)`, applied in order.
 const MIGRATIONS: &[(&str, &str)] = &[
-    ("0001_sessions", include_str!("../migrations/0001_sessions.sql")),
+    ("0001_sessions", include_str!("migrations/0001_sessions.sql")),
 ];
 
 const SESSION_COLUMNS: &str = "id, name, cwd, context, status, status_detail, title, \

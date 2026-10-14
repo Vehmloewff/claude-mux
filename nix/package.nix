@@ -23,7 +23,7 @@ rustPlatform.buildRustPackage {
     fileset = lib.fileset.unions [
       ../Cargo.toml
       ../Cargo.lock
-      ../src
+      (lib.fileset.difference (lib.fileset.fileFilter (file: file.hasExt "rs") ../.) (lib.fileset.maybeMissing ../target))
       (lib.fileset.maybeMissing ../migrations)
     ];
   };
