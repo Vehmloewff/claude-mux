@@ -81,12 +81,30 @@ pub struct Daemon {
 
 type Shared = Arc<Daemon>;
 
-pub fn run() -> Result<()> {
+/// Outcome of trying to become the daemon.
+pub enum Started {
+    /// Served until shutdown.
+    Ran,
+    /// Another claudexd holds the lock; nothing to do.
+    AlreadyRunning,
+}
+
+pub fn run() -> Result<Started> {
     std::fs::create_dir_all(paths::home())?;
-    let sock = paths::socket();
-    if UnixStream::connect(&sock).is_ok() {
-        bail!("a claudex daemon is already running at {}", sock.display());
+    // Exactly one daemon per state directory, even when several commands
+    // start one at the same moment. The lock is held until the process exits
+    // (the file is close-on-exec, so sessions don't inherit it).
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths::home().join("daemon.lock"))
+        .context("open daemon lock file")?;
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Ok(Started::AlreadyRunning);
     }
+    std::mem::forget(lock);
+    let sock = paths::socket();
     let db = Db::open(&paths::db_file())?;
     let sessions = load_sessions(&db)?;
     let _ = std::fs::remove_file(&sock);
@@ -105,7 +123,7 @@ pub fn run() -> Result<()> {
         std::thread::spawn(move || ticker(d));
     }
     {
-        // SIGTERM (e.g. `systemctl stop`) and SIGINT stop gracefully, leaving
+        // SIGTERM and SIGINT stop gracefully (like `claudex shutdown`), leaving
         // sessions resumable. The handler only sets a flag; this thread acts.
         let d = daemon.clone();
         install_signal_handlers();
@@ -127,7 +145,7 @@ pub fn run() -> Result<()> {
             }
         });
     }
-    Ok(())
+    Ok(Started::Ran)
 }
 
 fn load_sessions(db: &Db) -> Result<BTreeMap<String, Session>> {

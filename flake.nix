@@ -24,7 +24,6 @@
         "aarch64-darwin"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      modules = import ./nix/modules.nix { inherit self; };
     in
     {
       packages = forAllSystems (pkgs: {
@@ -36,8 +35,6 @@
         claudex = final.callPackage ./nix/package.nix { inherit ghostty-src; };
       };
 
-      nixosModules.default = modules.nixos;
-      homeManagerModules.default = modules.home-manager;
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {

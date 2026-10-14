@@ -21,53 +21,22 @@ Requires Rust, Zig 0.15 (`brew install zig@0.15`) and Claude Code on `PATH`.
 make install     # cargo install with the macOS SDK workaround applied
 ```
 
-Then start the daemon (`claudexd &`, or as a service) before using `claudex`.
+There's nothing else to set up: the first `claudex` command that needs the
+daemon starts `claudexd` in the background.
 
 ### Nix
 
-The flake provides `packages.<system>.default` (both binaries), an overlay,
-and modules that run `claudexd` as a systemd user service. It also has a
-`devShells.default`. The Ghostty source and its Zig dependencies are pinned
-as flake inputs, so the build needs no network access.
+The flake provides `packages.<system>.default` (both binaries), an overlay
+(`overlays.default`, adding `pkgs.claudex`) and a `devShells.default`. The
+Ghostty source and its Zig dependencies are pinned as flake inputs, so the
+build needs no network access.
 
-NixOS (the service runs for every user who logs in):
-
-```nix
-{
-  inputs.claudex.url = "github:Vehmloewff/claudex";
-
-  outputs = { nixpkgs, claudex, ... }: {
-    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
-      modules = [
-        claudex.nixosModules.default
-        ({ pkgs, ... }: {
-          services.claudexd.enable = true;
-          # claude and anything sessions need, unless already in the user profile
-          services.claudexd.extraPackages = [ pkgs.claude-code pkgs.git ];
-        })
-      ];
-    };
-  };
-}
+```sh
+nix run github:Vehmloewff/claudex -- list
+nix profile install github:Vehmloewff/claudex
 ```
 
-Home Manager (Linux):
-
-```nix
-{
-  imports = [ claudex.homeManagerModules.default ];
-  services.claudexd.enable = true;
-  services.claudexd.extraPackages = [ pkgs.claude-code pkgs.git ];
-}
-```
-
-Options: `enable`, `package`, `extraPackages` (put on the service's `PATH`
-ahead of the user and system profiles) and `environment` (e.g.
-`CLAUDEX_CLAUDE_BIN`). The unit uses `KillMode=mixed`, so on
-`systemctl --user stop claudexd` only the daemon gets `SIGTERM`. It then
-stops its claude sessions itself and records them as `stopped`, so
-`claudex resume` can pick them back up. Logs go to
-`journalctl --user -u claudexd`.
+No service module is needed, since `claudexd` starts on demand.
 
 Use `make build` / `make test` for development. The Makefile puts
 `tools/xcrun-shim` on `PATH`. The shim is needed because Zig 0.15's bundled
@@ -120,10 +89,16 @@ directory and age. The right pane shows the selected session's terminal.
 
 ## How it works
 
-- **Daemon.** `claudexd` is a separate binary that must be running before
-  `claudex` is used; `claudex` never starts it and errors if it is down. Run
-  it under a service manager (the nix module provides a systemd user unit)
-  or in the background. It listens
+- **Daemon.** `claudexd` is a separate binary that is never run as a
+  service. Any `claudex` command that needs it (everything except
+  `shutdown` and the internal hook) starts it if the socket doesn't answer.
+  It's double-forked into its own session, so it isn't a child of the
+  command that started it, and its output goes to `~/.claudex/daemon.log`.
+  A lock file (`~/.claudex/daemon.lock`) guarantees one daemon per state
+  directory even when several commands start it at once. It stays up until
+  `claudex shutdown` (or `SIGTERM`), which stops the sessions and records
+  them as `stopped` so they can be resumed. Run `claudexd` by hand to keep
+  it in the foreground with logs on stderr. It listens
   on `~/.claudex/daemon.sock`. It owns every claude process and its PTY.
   Session records are kept in a Turso database at `~/.claudex/state.db`, so
   sessions survive a daemon restart as `stopped` and can be resumed. Its
