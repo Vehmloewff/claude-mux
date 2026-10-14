@@ -1,6 +1,6 @@
-//! claudex: run and manage many Claude Code sessions.
+//! claude-mux: run and manage many Claude Code sessions.
 //!
-//! Shared by the `claudex` CLI and the `claudexd` daemon.
+//! Shared by the `claude-mux` CLI and the `claude-muxd` daemon.
 
 pub mod client;
 pub mod daemon;

@@ -1,4 +1,4 @@
-//! `claudex manage`: a sidebar of every session plus a live view of the
+//! `claude-mux manage`: a sidebar of every session plus a live view of the
 //! selected session's terminal (rendered from the daemon's libghostty
 //! state). Focus the terminal to type into claude directly.
 
@@ -627,7 +627,7 @@ impl App {
         let counts = |pred: fn(Status) -> bool| self.sessions.iter().filter(|s| pred(s.effective_status())).count();
         let working = counts(|s| matches!(s, Status::Working | Status::Starting));
         let waiting = counts(|s| s == Status::NeedsInput);
-        let mut title = vec![TSpan::raw(" claudex ").bold()];
+        let mut title = vec![TSpan::raw(" claude-mux ").bold()];
         if working > 0 {
             title.push(TSpan::raw(format!("{working}⠿ ")).fg(TColor::Yellow));
         }
@@ -649,7 +649,7 @@ impl App {
                 Line::raw(""),
                 Line::from(vec![TSpan::raw("Press "), TSpan::raw("n").bold().fg(TColor::Cyan), TSpan::raw(" to start one,")]),
                 Line::raw("or run:").fg(TColor::Gray),
-                Line::raw("claudex create \"…\"").fg(TColor::Cyan),
+                Line::raw("claude-mux create \"…\"").fg(TColor::Cyan),
             ])
             .wrap(Wrap { trim: true })
             .centered();

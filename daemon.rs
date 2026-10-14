@@ -1,4 +1,4 @@
-//! The claudex daemon: owns every claude process, its PTY and its
+//! The claude-mux daemon: owns every claude process, its PTY and its
 //! libghostty terminal, and serves the CLI / TUI over a Unix socket.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -27,7 +27,7 @@ const STRIP_ENV: &[&str] = &[
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SSE_PORT",
     "CLAUDE_CODE_SESSION_ID",
-    "CLAUDEX_SESSION_ID",
+    "CLAUDE_MUX_SESSION_ID",
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "TMUX",
@@ -85,7 +85,7 @@ type Shared = Arc<Daemon>;
 pub enum Started {
     /// Served until shutdown.
     Ran,
-    /// Another claudexd holds the lock; nothing to do.
+    /// Another claude-muxd holds the lock; nothing to do.
     AlreadyRunning,
 }
 
@@ -109,7 +109,7 @@ pub fn run() -> Result<Started> {
     let sessions = load_sessions(&db)?;
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    eprintln!("[{}] claudex daemon listening on {}", paths::now(), sock.display());
+    eprintln!("[{}] claude-mux daemon listening on {}", paths::now(), sock.display());
 
     let daemon: Shared = Arc::new(Daemon {
         inner: Mutex::new(Inner { sessions, version: 1 }),
@@ -123,7 +123,7 @@ pub fn run() -> Result<Started> {
         std::thread::spawn(move || ticker(d));
     }
     {
-        // SIGTERM and SIGINT stop gracefully (like `claudex shutdown`), leaving
+        // SIGTERM and SIGINT stop gracefully (like `claude-mux shutdown`), leaving
         // sessions resumable. The handler only sets a flag; this thread acts.
         let d = daemon.clone();
         install_signal_handlers();
@@ -467,7 +467,7 @@ fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
 }
 
 fn claude_bin() -> String {
-    std::env::var("CLAUDEX_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+    std::env::var("CLAUDE_MUX_CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
 }
 
 fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
@@ -497,11 +497,11 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "claudex");
-    cmd.env("CLAUDEX_SESSION_ID", &s.info.id);
-    cmd.env("CLAUDEX_HOME", paths::home());
-    cmd.env("CLAUDEX_SOCKET", paths::socket());
-    // Make `claudex` itself available so sessions can orchestrate others.
+    cmd.env("TERM_PROGRAM", "claude-mux");
+    cmd.env("CLAUDE_MUX_SESSION_ID", &s.info.id);
+    cmd.env("CLAUDE_MUX_HOME", paths::home());
+    cmd.env("CLAUDE_MUX_SOCKET", paths::socket());
+    // Make `claude-mux` itself available so sessions can orchestrate others.
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut parts = vec![dir];
@@ -613,7 +613,7 @@ fn shutdown(d: &Shared) {
     }
     d.touch(&mut inner);
     let _ = std::fs::remove_file(paths::socket());
-    eprintln!("[{}] claudex daemon shut down", paths::now());
+    eprintln!("[{}] claude-mux daemon shut down", paths::now());
     std::process::exit(0);
 }
 
@@ -769,7 +769,7 @@ fn accept_trust(term: &TermHandle) {
 }
 
 fn on_hook(d: &Shared, id: &str, event: &str, payload: Value) {
-    if std::env::var_os("CLAUDEX_DEBUG").is_some() {
+    if std::env::var_os("CLAUDE_MUX_DEBUG").is_some() {
         eprintln!("[{}] hook {id} {event} {payload}", paths::now());
     }
     let last_message = (event == "Stop").then(|| hooks::last_assistant_message(&payload)).flatten();
@@ -888,7 +888,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Live streaming for `claudex manage`
+// Live streaming for `claude-mux manage`
 
 #[derive(Clone, Default)]
 struct Watch {

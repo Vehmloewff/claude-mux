@@ -27,12 +27,12 @@
     in
     {
       packages = forAllSystems (pkgs: {
-        claudex = pkgs.callPackage ./nix/package.nix { inherit ghostty-src; };
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.claudex;
+        claude-mux = pkgs.callPackage ./nix/package.nix { inherit ghostty-src; };
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.claude-mux;
       });
 
       overlays.default = final: _prev: {
-        claudex = final.callPackage ./nix/package.nix { inherit ghostty-src; };
+        claude-mux = final.callPackage ./nix/package.nix { inherit ghostty-src; };
       };
 
 

@@ -215,7 +215,7 @@ mod tests {
     use crate::protocol::BackgroundTask;
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("claudex-db-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("claude-mux-db-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("state.db")

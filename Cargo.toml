@@ -1,5 +1,5 @@
 [package]
-name = "claudex"
+name = "claude-mux"
 version = "0.1.0"
 edition = "2024"
 autobins = false
@@ -8,12 +8,12 @@ autobins = false
 path = "lib.rs"
 
 [[bin]]
-name = "claudex"
+name = "claude-mux"
 path = "main.rs"
 
 [[bin]]
-name = "claudexd"
-path = "claudexd.rs"
+name = "claude-muxd"
+path = "claude-muxd.rs"
 
 [dependencies]
 anyhow = "1.0.104"

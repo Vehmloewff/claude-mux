@@ -1,8 +1,8 @@
-//! Wire protocol between `claudex` clients and the daemon.
+//! Wire protocol between `claude-mux` clients and the daemon.
 //!
 //! Every message is a single line of JSON. Most connections are a single
 //! request followed by a single response; `Subscribe` turns the connection
-//! into a bidirectional stream used by `claudex manage`.
+//! into a bidirectional stream used by `claude-mux manage`.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +44,7 @@ impl Status {
         !matches!(self, Status::Exited | Status::Stopped)
     }
 
-    /// Whether `claudex wait` should stop waiting on this status.
+    /// Whether `claude-mux wait` should stop waiting on this status.
     pub fn is_settled(self) -> bool {
         matches!(
             self,

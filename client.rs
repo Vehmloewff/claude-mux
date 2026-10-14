@@ -47,7 +47,7 @@ fn try_connect() -> Option<Conn> {
     Some(Conn { reader: BufReader::new(stream), writer })
 }
 
-/// Connect to the daemon, starting `claudexd` first if it isn't running.
+/// Connect to the daemon, starting `claude-muxd` first if it isn't running.
 pub fn connect() -> Result<Conn> {
     if let Some(conn) = try_connect() {
         return Ok(conn);
@@ -61,7 +61,7 @@ pub fn connect() -> Result<Conn> {
         std::thread::sleep(Duration::from_millis(25));
     }
     bail!(
-        "started claudexd but it isn't answering at {} (see {})",
+        "started claude-muxd but it isn't answering at {} (see {})",
         paths::socket().display(),
         paths::log_file().display()
     )
@@ -72,13 +72,13 @@ pub fn connect_existing() -> Option<Conn> {
     try_connect()
 }
 
-/// Start claudexd fully detached: double-forked so it is re-parented to
+/// Start claude-muxd fully detached: double-forked so it is re-parented to
 /// init/launchd rather than staying a child of this command, in its own
 /// session, with output appended to the daemon log. If several commands race
-/// to start it, claudexd's lock file lets only one of them run.
+/// to start it, claude-muxd's lock file lets only one of them run.
 fn spawn_daemon() -> Result<()> {
     std::fs::create_dir_all(paths::home())?;
-    let exe = paths::sibling_exe("claudexd");
+    let exe = paths::sibling_exe("claude-muxd");
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -91,7 +91,7 @@ fn spawn_daemon() -> Result<()> {
             // Only async-signal-safe calls here (we are between fork and exec).
             match libc::fork() {
                 -1 => return Err(std::io::Error::last_os_error()),
-                0 => {}                  // grandchild: becomes claudexd
+                0 => {}                  // grandchild: becomes claude-muxd
                 _ => libc::_exit(0),     // intermediate child: exit right away
             }
             libc::setsid();
@@ -100,8 +100,8 @@ fn spawn_daemon() -> Result<()> {
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to start {} (is claudexd installed?)", exe.display()))?;
-    // Reap the intermediate process; claudexd itself is no longer our child.
+        .with_context(|| format!("failed to start {} (is claude-muxd installed?)", exe.display()))?;
+    // Reap the intermediate process; claude-muxd itself is no longer our child.
     let _ = child.wait();
     Ok(())
 }

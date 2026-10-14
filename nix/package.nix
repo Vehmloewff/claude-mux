@@ -15,7 +15,7 @@ let
   zigDeps = callPackage "${ghostty-src}/build.zig.zon.nix" { name = "ghostty-zig-deps"; };
 in
 rustPlatform.buildRustPackage {
-  pname = "claudex";
+  pname = "claude-mux";
   inherit (cargoToml.package) version;
 
   src = lib.fileset.toSource {
@@ -62,8 +62,8 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Run and manage many Claude Code sessions from one place";
-    homepage = "https://github.com/Vehmloewff/claudex";
-    mainProgram = "claudex";
+    homepage = "https://github.com/Vehmloewff/claude-mux";
+    mainProgram = "claude-mux";
     platforms = lib.platforms.unix;
   };
 }

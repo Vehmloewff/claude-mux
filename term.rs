@@ -62,7 +62,7 @@ impl TermHandle {
     ) -> TermHandle {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
-            .name("claudex-term".into())
+            .name("claude-mux-term".into())
             .spawn(move || {
                 if let Err(e) = run(cols, rows, writer, rx, on_event) {
                     eprintln!("terminal thread failed: {e}");

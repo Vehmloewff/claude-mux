@@ -1,8 +1,8 @@
 //! Claude Code hook integration.
 //!
 //! Each managed claude is started with `--settings` containing hooks that
-//! call `claudex hook <Event>`. The hook forwards its JSON payload to the
-//! daemon, which is how claudex knows when a session is working, blocked on
+//! call `claude-mux hook <Event>`. The hook forwards its JSON payload to the
+//! daemon, which is how claude-mux knows when a session is working, blocked on
 //! a permission prompt, or done with its turn.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,7 +29,7 @@ fn shell_quote(s: &str) -> String {
 
 /// The `--settings` JSON passed to every managed claude.
 pub fn settings_json() -> String {
-    let exe = paths::sibling_exe("claudex").to_string_lossy().into_owned();
+    let exe = paths::sibling_exe("claude-mux").to_string_lossy().into_owned();
     let mut hooks = serde_json::Map::new();
     for event in EVENTS {
         hooks.insert(
@@ -44,10 +44,10 @@ pub fn settings_json() -> String {
     json!({ "hooks": hooks }).to_string()
 }
 
-/// Entry point for `claudex hook <event>`. Never fails loudly: a broken
+/// Entry point for `claude-mux hook <event>`. Never fails loudly: a broken
 /// daemon must not break the claude session.
 pub fn run_hook(event: &str) {
-    let Ok(id) = std::env::var("CLAUDEX_SESSION_ID") else { return };
+    let Ok(id) = std::env::var("CLAUDE_MUX_SESSION_ID") else { return };
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn reads_transcript_fallback() {
-        let dir = std::env::temp_dir().join(format!("claudex-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("claude-mux-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.jsonl");
         std::fs::write(

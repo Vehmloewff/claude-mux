@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 
-/// Root directory for daemon state: `$CLAUDEX_HOME` or `~/.claudex`.
+/// Root directory for daemon state: `$CLAUDE_MUX_HOME` or `~/.claude-mux`.
 pub fn home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("CLAUDEX_HOME") {
+    if let Some(dir) = std::env::var_os("CLAUDE_MUX_HOME") {
         return PathBuf::from(dir);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/tmp".into());
-    home.join(".claudex")
+    home.join(".claude-mux")
 }
 
-/// `$CLAUDEX_SOCKET`, else `<home>/daemon.sock` — unless that exceeds the
+/// `$CLAUDE_MUX_SOCKET`, else `<home>/daemon.sock` — unless that exceeds the
 /// Unix socket path limit, in which case a short per-home path in /tmp.
 pub fn socket() -> PathBuf {
-    if let Some(path) = std::env::var_os("CLAUDEX_SOCKET") {
+    if let Some(path) = std::env::var_os("CLAUDE_MUX_SOCKET") {
         return PathBuf::from(path);
     }
     let path = home().join("daemon.sock");
@@ -23,7 +23,7 @@ pub fn socket() -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     home().hash(&mut h);
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/claudex-{uid}-{:012x}.sock", h.finish() & 0xffff_ffff_ffff))
+    PathBuf::from(format!("/tmp/claude-mux-{uid}-{:012x}.sock", h.finish() & 0xffff_ffff_ffff))
 }
 
 pub fn db_file() -> PathBuf {
@@ -41,7 +41,7 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Locate a sibling claudex executable (`claudex` / `claudexd`): next to the
+/// Locate a sibling claude-mux executable (`claude-mux` / `claude-muxd`): next to the
 /// running binary if present, otherwise rely on PATH.
 pub fn sibling_exe(name: &str) -> PathBuf {
     std::env::current_exe()
