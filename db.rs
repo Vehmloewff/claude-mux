@@ -8,15 +8,30 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
+use include_dir::{Dir, include_dir};
 use turso::Value;
 
 use crate::paths;
 use crate::protocol::{SessionInfo, Status};
 
-/// `(name, sql)`, applied in order.
-const MIGRATIONS: &[(&str, &str)] = &[
-    ("0001_sessions", include_str!("migrations/0001_sessions.sql")),
-];
+/// Every `migrations/*.sql` file, applied in file-name order. A migration's
+/// name is its file stem.
+static MIGRATIONS: Dir = include_dir!("$CARGO_MANIFEST_DIR/migrations");
+
+/// `(name, sql)` for each embedded migration, in the order to apply them.
+fn migrations() -> Vec<(&'static str, &'static str)> {
+    let mut migrations: Vec<_> = MIGRATIONS
+        .files()
+        .filter(|f| f.path().extension().is_some_and(|e| e == "sql"))
+        .map(|f| {
+            let name = f.path().file_stem().and_then(|s| s.to_str()).expect("UTF-8 migration name");
+            let sql = f.contents_utf8().expect("UTF-8 migration");
+            (name, sql)
+        })
+        .collect();
+    migrations.sort_by_key(|&(name, _)| name);
+    migrations
+}
 
 const SESSION_COLUMNS: &str = "id, name, cwd, context, status, status_detail, title, \
     claude_session_id, created_at, updated_at, exit_code, turns, last_message, \
@@ -64,7 +79,7 @@ impl Db {
             }
             drop(rows);
 
-            for (name, sql) in MIGRATIONS {
+            for (name, sql) in migrations() {
                 if applied.iter().any(|a| a == name) {
                     continue;
                 }
@@ -74,7 +89,7 @@ impl Db {
                     self.conn
                         .execute(
                             "INSERT INTO _applied_migrations (name, applied_at) VALUES (?1, ?2)",
-                            (*name, paths::now() as i64),
+                            (name, paths::now() as i64),
                         )
                         .await?;
                     self.conn.execute("COMMIT", ()).await?;
