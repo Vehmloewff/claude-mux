@@ -2,7 +2,7 @@
 
 One place to run and manage all your Claude Code sessions. Each session is a
 real interactive `claude` running in a pseudo-terminal and emulated with
-[libghostty](https://ghostty.org) (`libghostty-vt`). That means people, scripts
+[`alacritty_terminal`](https://crates.io/crates/alacritty_terminal). That means people, scripts
 and other Claude sessions can all create sessions, send them work and wait
 for results, while you watch and steer them from one TUI.
 
@@ -15,7 +15,7 @@ claude-mux manage                                                             # 
 
 ## Install
 
-Requires Rust, Zig 0.16 (`brew install zig@0.16`) and Claude Code on `PATH`.
+Requires Rust and Claude Code on `PATH`.
 
 ```sh
 cargo install --path . --locked
@@ -27,9 +27,7 @@ daemon starts `claude-muxd` in the background.
 ### Nix
 
 The flake provides `packages.<system>.default` (both binaries), an overlay
-(`overlays.default`, adding `pkgs.claude-mux`) and a `devShells.default`. The
-Ghostty source and its Zig dependencies are pinned as flake inputs, so the
-build needs no network access.
+(`overlays.default`, adding `pkgs.claude-mux`) and a `devShells.default`.
 
 ```sh
 nix run github:Vehmloewff/claude-mux -- list
@@ -79,8 +77,8 @@ directory and age. The right pane shows the selected session's terminal.
   focus the terminal, `n` new session, `s` send a message, `x` kill, `r`
   resume, `d` delete, `R` rename, `PgUp`/`PgDn` or the mouse wheel to scroll,
   `?` help, `q` quit. Quitting doesn't stop any sessions.
-- **Terminal focused:** every key goes to claude, encoded by libghostty
-  (kitty keyboard protocol and paste included). `ctrl-]` returns to the list.
+- **Terminal focused:** every key goes to claude, encoded in the daemon
+  (kitty keyboard protocol and bracketed paste included). `ctrl-]` returns to the list.
 
 ## How it works
 
@@ -100,9 +98,9 @@ directory and age. The right pane shows the selected session's terminal.
   schema is a set of migrations embedded in the binary (`migrations/`), which
   the daemon applies on startup and records in `_applied_migrations`. Claude Code's own session
   id is fixed with `--session-id`, which lets `resume` use `claude --resume`.
-- **Terminal emulation.** All PTY output is fed into a libghostty-vt
-  `Terminal`, one per session, each on its own thread because the handles are
-  `!Send`. That terminal answers claude's queries, encodes keys, mouse and
+- **Terminal emulation.** All PTY output is fed into an
+  `alacritty_terminal` `Term`, one per session, each on its own thread. That
+  terminal answers claude's queries, encodes keys, mouse and
   paste, and produces render snapshots. The TUI receives those snapshots as
   styled spans.
 - **Status.** Every claude is started with `--settings` hooks

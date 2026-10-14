@@ -3,19 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # Must match GHOSTTY_COMMIT in the libghostty-vt-sys crate (Cargo.lock).
-    ghostty-src = {
-      url = "github:ghostty-org/ghostty/3425025e585a3403340d4dc6d65132f42e05e605";
-      flake = false;
-    };
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      ghostty-src,
-    }:
+    { self, nixpkgs }:
     let
       systems = [
         "x86_64-linux"
@@ -27,14 +18,13 @@
     in
     {
       packages = forAllSystems (pkgs: {
-        claude-mux = pkgs.callPackage ./nix/package.nix { inherit ghostty-src; };
+        claude-mux = pkgs.callPackage ./nix/package.nix { };
         default = self.packages.${pkgs.stdenv.hostPlatform.system}.claude-mux;
       });
 
       overlays.default = final: _prev: {
-        claude-mux = final.callPackage ./nix/package.nix { inherit ghostty-src; };
+        claude-mux = final.callPackage ./nix/package.nix { };
       };
-
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {

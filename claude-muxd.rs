@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 /// The claude-mux daemon: owns every Claude Code session, its PTY and its
-/// libghostty terminal, and serves `claude-mux` over a Unix socket.
+/// terminal emulator, and serves `claude-mux` over a Unix socket.
 ///
 /// Any `claude-mux` command that needs it starts it automatically, detached, so
 /// there is no need to run it yourself or install it as a service. Running it

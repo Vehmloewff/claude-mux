@@ -216,7 +216,7 @@ pub enum StreamEvent {
     Screen { id: String, screen: Screen },
 }
 
-/// A terminal-independent key press, encoded to bytes by libghostty in the
+/// A terminal-independent key press, encoded to bytes by the terminal in the
 /// daemon (so the session's keyboard modes, e.g. kitty protocol, apply).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyInput {

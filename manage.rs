@@ -1,5 +1,5 @@
 //! `claude-mux manage`: a sidebar of every session plus a live view of the
-//! selected session's terminal (rendered from the daemon's libghostty
+//! selected session's terminal (rendered from the daemon's emulator
 //! state). Focus the terminal to type into claude directly.
 
 use std::io::Write;
@@ -1046,7 +1046,7 @@ fn to_style(cs: &CellStyle) -> Style {
     style.add_modifier(m)
 }
 
-/// Paint a libghostty screen snapshot into the ratatui buffer.
+/// Paint a screen snapshot into the ratatui buffer.
 fn render_screen(buf: &mut Buffer, area: Rect, screen: &Screen) {
     for (y, spans) in screen.lines.iter().enumerate() {
         if y as u16 >= area.height {

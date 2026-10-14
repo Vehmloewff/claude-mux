@@ -1,5 +1,5 @@
 //! The claude-mux daemon: owns every claude process, its PTY and its
-//! libghostty terminal, and serves the CLI / TUI over a Unix socket.
+//! terminal emulator, and serves the CLI / TUI over a Unix socket.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};

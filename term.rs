@@ -1,24 +1,23 @@
-//! A libghostty-vt terminal emulator for one session.
+//! An alacritty_terminal emulator for one session.
 //!
-//! libghostty handles are `!Send`, so each session's terminal lives on its
-//! own thread and is driven through a channel (`TermHandle`).
+//! Each session's terminal lives on its own thread and is driven through a
+//! channel (`TermHandle`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::key::{self, Key, Mods};
-use libghostty_vt::mouse;
-use libghostty_vt::render::{CellIterator, RowIterator};
-use libghostty_vt::screen::{CellContentTag, CellWide};
-use libghostty_vt::style::{StyleColor, Underline};
-use libghostty_vt::terminal::{Mode, ScrollViewport};
-use libghostty_vt::{RenderState, Terminal};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{self, NamedColor, Processor, Rgb, StdSyncHandler};
 
 use crate::protocol::{self, CellStyle, Color, KeyCode, KeyInput, Screen, Span};
 
@@ -63,11 +62,7 @@ impl TermHandle {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("claude-mux-term".into())
-            .spawn(move || {
-                if let Err(e) = run(cols, rows, writer, rx, on_event) {
-                    eprintln!("terminal thread failed: {e}");
-                }
-            })
+            .spawn(move || run(cols, rows, writer, rx, on_event))
             .expect("spawn terminal thread");
         TermHandle { tx }
     }
@@ -102,62 +97,101 @@ impl TermHandle {
     }
 }
 
-struct Emu {
-    term: Terminal<'static, 'static>,
-    render: RenderState<'static>,
-    rows_it: RowIterator<'static>,
-    cells_it: CellIterator<'static>,
-    keys: key::Encoder<'static>,
-    key_event: key::Event<'static>,
-    mouse: mouse::Encoder<'static>,
-    mouse_event: mouse::Event<'static>,
-    writer: PtyWriter,
+/// Collects the terminal's events so they can be handled once it's done
+/// parsing (some need the terminal itself to answer).
+#[derive(Clone, Default)]
+struct Events(Rc<RefCell<Vec<Event>>>);
+
+impl EventListener for Events {
+    fn send_event(&self, event: Event) {
+        self.0.borrow_mut().push(event);
+    }
 }
 
-fn run(
-    cols: u16,
-    rows: u16,
+struct Size {
+    cols: usize,
+    rows: usize,
+}
+
+impl Dimensions for Size {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+struct Emu {
+    term: Term<Events>,
+    parser: Processor<StdSyncHandler>,
+    events: Events,
     writer: PtyWriter,
-    rx: Receiver<Msg>,
-    on_event: impl Fn(TermEvent),
-) -> anyhow::Result<()> {
-    let mut term = Terminal::new(cols, rows)?;
-    term.set_scrollback_max_lines(Some(10_000))?;
-    let title_changed = Rc::new(RefCell::new(false));
-    {
-        let writer = writer.clone();
-        let title_changed = title_changed.clone();
-        term.on_pty_write(move |_t, data| {
-            // Replies to queries (device attributes, cursor position, ...).
-            if let Ok(mut w) = writer.lock() {
-                let _ = w.write_all(data);
-                let _ = w.flush();
-            }
-        })?
-        .on_title_changed(move |_t| {
-            *title_changed.borrow_mut() = true;
-        })?
-        .on_size(move |t| {
-            Some(libghostty_vt::terminal::SizeReportSize {
-                rows: t.rows().unwrap_or(rows),
-                columns: t.cols().unwrap_or(cols),
-                cell_width: 8,
-                cell_height: 16,
-            })
-        })?;
+    /// Set when the title changed since it was last reported.
+    title: Option<String>,
+}
+
+impl Emu {
+    fn new(cols: u16, rows: u16, scrollback: usize, writer: PtyWriter) -> Emu {
+        let config = Config { scrolling_history: scrollback, kitty_keyboard: true, ..Config::default() };
+        let size = Size { cols: cols as usize, rows: rows as usize };
+        let events = Events::default();
+        Emu {
+            term: Term::new(config, &size, events.clone()),
+            parser: Processor::new(),
+            events,
+            writer,
+            title: None,
+        }
     }
 
-    let mut emu = Emu {
-        term,
-        render: RenderState::new()?,
-        rows_it: RowIterator::new()?,
-        cells_it: CellIterator::new()?,
-        keys: key::Encoder::new()?,
-        key_event: key::Event::new()?,
-        mouse: mouse::Encoder::new()?,
-        mouse_event: mouse::Event::new()?,
-        writer,
-    };
+    fn vt_write(&mut self, data: &[u8]) {
+        self.parser.advance(&mut self.term, data);
+        self.handle_events();
+    }
+
+    /// When a synchronized update that hasn't finished must be flushed.
+    fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    fn flush_sync(&mut self) {
+        self.parser.stop_sync(&mut self.term);
+        self.handle_events();
+    }
+
+    fn handle_events(&mut self) {
+        let events = std::mem::take(&mut *self.events.0.borrow_mut());
+        for event in events {
+            match event {
+                // Replies to queries (device attributes, cursor position, ...).
+                Event::PtyWrite(text) => write_pty(self, text.as_bytes()),
+                Event::ColorRequest(index, format) => {
+                    let color = self.term.colors()[index].unwrap_or_else(|| default_color(index));
+                    write_pty(self, format(color).as_bytes());
+                }
+                Event::TextAreaSizeRequest(format) => {
+                    let size = WindowSize {
+                        num_lines: self.term.screen_lines() as u16,
+                        num_cols: self.term.columns() as u16,
+                        cell_width: 8,
+                        cell_height: 16,
+                    };
+                    write_pty(self, format(size).as_bytes());
+                }
+                Event::Title(title) => self.title = Some(title),
+                Event::ResetTitle => self.title = Some(String::new()),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn run(cols: u16, rows: u16, writer: PtyWriter, rx: Receiver<Msg>, on_event: impl Fn(TermEvent)) {
+    let mut emu = Emu::new(cols, rows, 10_000, writer);
 
     let mut last_scan = Instant::now() - Duration::from_secs(1);
     let mut scan_pending = false;
@@ -165,23 +199,29 @@ fn run(
     let mut background = false;
 
     loop {
-        let timeout = if scan_pending { Duration::from_millis(150) } else { Duration::from_secs(3600) };
-        match rx.recv_timeout(timeout) {
+        let now = Instant::now();
+        let mut deadline = now + Duration::from_secs(3600);
+        if scan_pending {
+            deadline = deadline.min(now + Duration::from_millis(150));
+        }
+        if let Some(sync) = emu.sync_deadline() {
+            deadline = deadline.min(sync);
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
             Ok(Msg::Output(data)) => {
-                emu.term.vt_write(&data);
+                emu.vt_write(&data);
                 // Drain any further queued output before notifying.
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
-                        Msg::Output(more) => emu.term.vt_write(&more),
+                        Msg::Output(more) => emu.vt_write(&more),
                         other => {
                             handle(&mut emu, other);
                         }
                     }
                 }
-                if std::mem::take(&mut *title_changed.borrow_mut())
-                    && let Ok(title) = emu.term.title() {
-                        on_event(TermEvent::Title(clean_title(title)));
-                    }
+                if let Some(title) = emu.title.take() {
+                    on_event(TermEvent::Title(clean_title(&title)));
+                }
                 on_event(TermEvent::Dirty);
                 scan_pending = true;
             }
@@ -191,14 +231,21 @@ fn run(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+
+        // A synchronized update that never ended: show what we have.
+        if emu.sync_deadline().is_some_and(|t| t <= Instant::now()) {
+            emu.flush_sync();
+            on_event(TermEvent::Dirty);
+            scan_pending = true;
         }
 
         // Look for blocking dialogs, throttled since it walks the screen.
         if scan_pending && last_scan.elapsed() >= Duration::from_millis(150) {
             scan_pending = false;
             last_scan = Instant::now();
-            let text = viewport_text(&mut emu);
+            let text = viewport_text(&emu);
             let found = detect_prompt(&text);
             if found != prompt {
                 prompt = found.clone();
@@ -225,58 +272,50 @@ fn clean_title(title: &str) -> String {
 fn handle(emu: &mut Emu, msg: Msg) -> bool {
     match msg {
         Msg::Output(data) => {
-            emu.term.vt_write(&data);
+            emu.vt_write(&data);
             true
         }
         Msg::Resize(cols, rows) => {
-            let cols = cols.max(10);
-            let rows = rows.max(3);
-            if emu.term.cols().ok() != Some(cols) || emu.term.rows().ok() != Some(rows) {
-                let _ = emu.term.resize(cols, rows, 8, 16);
+            let cols = cols.max(10) as usize;
+            let rows = rows.max(3) as usize;
+            if emu.term.columns() != cols || emu.term.screen_lines() != rows {
+                emu.term.resize(Size { cols, rows });
             }
             true
         }
         Msg::Key(input) => {
-            let bytes = encode_key(emu, &input);
-            emu.term.scroll_viewport(ScrollViewport::Bottom);
+            let bytes = encode_key(*emu.term.mode(), &input);
+            emu.term.scroll_display(Scroll::Bottom);
             write_pty(emu, &bytes);
             true
         }
         Msg::Paste(text) => {
-            let bracketed = emu.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
-            let mut data = text.into_bytes();
-            let mut buf = vec![0u8; data.len() * 2 + 16];
-            let bytes = match libghostty_vt::paste::encode(&mut data, bracketed, &mut buf) {
-                Ok(n) => buf[..n].to_vec(),
-                Err(_) => data,
-            };
-            emu.term.scroll_viewport(ScrollViewport::Bottom);
+            let bytes = encode_paste(&text, emu.term.mode().contains(TermMode::BRACKETED_PASTE));
+            emu.term.scroll_display(Scroll::Bottom);
             write_pty(emu, &bytes);
             true
         }
         Msg::Scroll { delta, col, row } => {
-            if emu.term.is_mouse_tracking().unwrap_or(false) {
-                let bytes = encode_wheel(emu, delta, col, row);
+            let mode = *emu.term.mode();
+            if mode.intersects(TermMode::MOUSE_MODE) {
+                let bytes = encode_wheel(mode, delta, col, row);
                 write_pty(emu, &bytes);
             } else {
-                emu.term.scroll_viewport(ScrollViewport::Delta(delta as isize));
+                // Positive deltas scroll alacritty's viewport up.
+                emu.term.scroll_display(Scroll::Delta(-delta));
             }
             true
         }
         Msg::ScrollReset => {
-            emu.term.scroll_viewport(ScrollViewport::Bottom);
+            emu.term.scroll_display(Scroll::Bottom);
             true
         }
         Msg::Snapshot(reply) => {
-            let _ = reply.send(snapshot(emu).unwrap_or_default());
+            let _ = reply.send(snapshot(emu));
             false
         }
         Msg::Text { scrollback, ansi, reply } => {
-            let text = if scrollback || ansi {
-                format_screen(emu, if ansi { Format::Vt } else { Format::Plain })
-            } else {
-                viewport_text(emu)
-            };
+            let text = if scrollback || ansi { format_screen(emu, scrollback, ansi) } else { viewport_text(emu) };
             let _ = reply.send(text);
             false
         }
@@ -293,169 +332,242 @@ fn write_pty(emu: &Emu, bytes: &[u8]) {
     }
 }
 
-fn encode_key(emu: &mut Emu, input: &KeyInput) -> Vec<u8> {
-    let mut mods = Mods::empty();
-    if input.shift {
-        mods |= Mods::SHIFT;
+/// The xterm modifier parameter: 1 + shift(1) | alt(2) | ctrl(4) | super(8).
+fn mod_param(input: &KeyInput) -> u8 {
+    1 + input.shift as u8 + 2 * input.alt as u8 + 4 * input.ctrl as u8 + 8 * input.sup as u8
+}
+
+/// Encode a key press the way xterm does, or with the kitty keyboard
+/// protocol when the application has turned it on.
+fn encode_key(mode: TermMode, input: &KeyInput) -> Vec<u8> {
+    let mut input = input.clone();
+    if input.code == KeyCode::BackTab {
+        input.code = KeyCode::Tab;
+        input.shift = true;
     }
-    if input.ctrl {
-        mods |= Mods::CTRL;
-    }
-    if input.alt {
-        mods |= Mods::ALT;
-    }
-    if input.sup {
-        mods |= Mods::SUPER;
-    }
-    let (key, text, unshifted) = match &input.code {
-        KeyCode::Char(c) => {
-            let (key, unshifted) = physical_key(*c);
-            (key, Some(c.to_string()), unshifted)
+    let kitty = mode.contains(TermMode::DISAMBIGUATE_ESC_CODES);
+    let all_as_esc = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let m = mod_param(&input);
+    // Modifiers other than shift, which only changes the text of a char.
+    let modified = input.ctrl || input.alt || input.sup;
+    let csi_u = |code: u32, m: u8| {
+        if m == 1 { format!("\x1b[{code}u") } else { format!("\x1b[{code};{m}u") }.into_bytes()
+    };
+    let esc = |mut bytes: Vec<u8>, alt: bool| {
+        if alt {
+            bytes.insert(0, 0x1b);
         }
-        KeyCode::Enter => (Key::Enter, None, None),
-        KeyCode::Tab => (Key::Tab, None, None),
-        KeyCode::BackTab => {
-            mods |= Mods::SHIFT;
-            (Key::Tab, None, None)
-        }
-        KeyCode::Backspace => (Key::Backspace, None, None),
-        KeyCode::Escape => (Key::Escape, None, None),
-        KeyCode::Up => (Key::ArrowUp, None, None),
-        KeyCode::Down => (Key::ArrowDown, None, None),
-        KeyCode::Left => (Key::ArrowLeft, None, None),
-        KeyCode::Right => (Key::ArrowRight, None, None),
-        KeyCode::Home => (Key::Home, None, None),
-        KeyCode::End => (Key::End, None, None),
-        KeyCode::PageUp => (Key::PageUp, None, None),
-        KeyCode::PageDown => (Key::PageDown, None, None),
-        KeyCode::Insert => (Key::Insert, None, None),
-        KeyCode::Delete => (Key::Delete, None, None),
-        KeyCode::F(n) => (function_key(*n), None, None),
+        bytes
     };
 
-    emu.keys.set_options_from_terminal(&emu.term);
-    emu.keys.set_macos_option_as_alt(key::OptionAsAlt::True);
-    let ev = &mut emu.key_event;
-    ev.set_action(key::Action::Press)
-        .set_key(key)
-        .set_mods(mods)
-        .set_consumed_mods(if text.is_some() && input.shift { Mods::SHIFT } else { Mods::empty() })
-        .set_composing(false)
-        .set_utf8(if input.ctrl { None } else { text.clone() });
-    if let Some(u) = unshifted {
-        ev.set_unshifted_codepoint(u);
+    match input.code {
+        KeyCode::Char(c) => {
+            let base = unshifted(c);
+            if all_as_esc || (kitty && modified) {
+                return csi_u(base as u32, m);
+            }
+            if input.ctrl
+                && let Some(b) = ctrl_byte(base)
+            {
+                return esc(vec![b], input.alt);
+            }
+            esc(c.to_string().into_bytes(), input.alt)
+        }
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Escape => {
+            let (code, plain) = match input.code {
+                KeyCode::Enter => (13, b'\r'),
+                KeyCode::Tab => (9, b'\t'),
+                KeyCode::Backspace => (127, 0x7f),
+                _ => (27, 0x1b),
+            };
+            if all_as_esc || (kitty && (m != 1 || input.code == KeyCode::Escape)) {
+                return csi_u(code, m);
+            }
+            match input.code {
+                KeyCode::Tab if input.shift => b"\x1b[Z".to_vec(),
+                KeyCode::Backspace if input.ctrl => esc(vec![0x08], input.alt),
+                _ => esc(vec![plain], input.alt),
+            }
+        }
+        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left | KeyCode::Home | KeyCode::End => {
+            let letter = match input.code {
+                KeyCode::Up => 'A',
+                KeyCode::Down => 'B',
+                KeyCode::Right => 'C',
+                KeyCode::Left => 'D',
+                KeyCode::Home => 'H',
+                _ => 'F',
+            };
+            if m != 1 {
+                format!("\x1b[1;{m}{letter}").into_bytes()
+            } else if mode.contains(TermMode::APP_CURSOR) {
+                format!("\x1bO{letter}").into_bytes()
+            } else {
+                format!("\x1b[{letter}").into_bytes()
+            }
+        }
+        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Insert | KeyCode::Delete => {
+            let n = match input.code {
+                KeyCode::Insert => 2,
+                KeyCode::Delete => 3,
+                KeyCode::PageUp => 5,
+                _ => 6,
+            };
+            tilde(n, m)
+        }
+        KeyCode::F(n @ 1..=4) => {
+            let letter = (b'P' + n - 1) as char;
+            if m != 1 { format!("\x1b[1;{m}{letter}") } else { format!("\x1bO{letter}") }.into_bytes()
+        }
+        KeyCode::F(n @ 5..=12) => {
+            const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
+            tilde(CODES[(n - 5) as usize], m)
+        }
+        KeyCode::F(_) | KeyCode::BackTab => Vec::new(),
     }
-    let mut out = Vec::with_capacity(16);
-    if emu.keys.encode_to_vec(&emu.key_event, &mut out).is_err() || out.is_empty() {
-        // Keys libghostty has no mapping for: send the text as typed.
-        if let Some(t) = text {
-            out = t.into_bytes();
-            if input.alt {
-                out.insert(0, 0x1b);
+}
+
+fn tilde(n: u8, m: u8) -> Vec<u8> {
+    if m != 1 { format!("\x1b[{n};{m}~") } else { format!("\x1b[{n}~") }.into_bytes()
+}
+
+/// The control code a ctrl+key chord produces in a legacy terminal.
+fn ctrl_byte(c: char) -> Option<u8> {
+    Some(match c {
+        'a'..='z' => c as u8 - b'a' + 1,
+        '@' | ' ' | '2' => 0,
+        '[' | '3' => 0x1b,
+        '\\' | '4' => 0x1c,
+        ']' | '5' => 0x1d,
+        '^' | '6' => 0x1e,
+        '_' | '-' | '/' | '7' => 0x1f,
+        '8' => 0x7f,
+        _ => return None,
+    })
+}
+
+/// The character the same key gives without shift on a US layout.
+fn unshifted(c: char) -> char {
+    if c.is_ascii_uppercase() {
+        return c.to_ascii_lowercase();
+    }
+    const SHIFTED: &str = "~!@#$%^&*()_+{}|:\"<>?";
+    const BASE: &str = "`1234567890-=[]\\;',./";
+    SHIFTED.find(c).and_then(|i| BASE.chars().nth(i)).unwrap_or(c)
+}
+
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        // Drop escapes so the text can't end the paste early.
+        let clean: String = text.chars().filter(|&c| c != '\x1b').collect();
+        format!("\x1b[200~{clean}\x1b[201~").into_bytes()
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
+fn encode_wheel(mode: TermMode, delta: i32, col: u16, row: u16) -> Vec<u8> {
+    let button: u32 = if delta < 0 { 64 } else { 65 };
+    let (x, y) = (col as u32 + 1, row as u32 + 1);
+    let event = if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{button};{x};{y}M").into_bytes()
+    } else if mode.contains(TermMode::UTF8_MOUSE) {
+        let mut s = String::from("\x1b[M");
+        for v in [button, x, y] {
+            s.push(char::from_u32(32 + v.min(2015)).unwrap_or(' '));
+        }
+        s.into_bytes()
+    } else {
+        let byte = |v: u32| (32 + v).min(255) as u8;
+        vec![0x1b, b'[', b'M', byte(button), byte(x), byte(y)]
+    };
+    event.repeat(delta.unsigned_abs().min(10) as usize)
+}
+
+/// Default colors, reported when an application asks for them.
+fn default_color(index: usize) -> Rgb {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0x00, 0x00, 0x00), (0xcd, 0x00, 0x00), (0x00, 0xcd, 0x00), (0xcd, 0xcd, 0x00),
+        (0x00, 0x00, 0xee), (0xcd, 0x00, 0xcd), (0x00, 0xcd, 0xcd), (0xe5, 0xe5, 0xe5),
+        (0x7f, 0x7f, 0x7f), (0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0xff, 0xff, 0x00),
+        (0x5c, 0x5c, 0xff), (0xff, 0x00, 0xff), (0x00, 0xff, 0xff), (0xff, 0xff, 0xff),
+    ];
+    let (r, g, b) = match index {
+        0..16 => ANSI[index],
+        16..232 => {
+            let i = index - 16;
+            let level = |v: usize| if v == 0 { 0 } else { (55 + v * 40) as u8 };
+            (level(i / 36), level(i / 6 % 6), level(i % 6))
+        }
+        232..256 => {
+            let v = (8 + (index - 232) * 10) as u8;
+            (v, v, v)
+        }
+        i if i == NamedColor::Background as usize => (0x28, 0x2c, 0x34),
+        _ => (0xff, 0xff, 0xff),
+    };
+    Rgb { r, g, b }
+}
+
+fn color_of(c: ansi::Color) -> Option<Color> {
+    match c {
+        ansi::Color::Spec(rgb) => Some(Color::Rgb([rgb.r, rgb.g, rgb.b])),
+        ansi::Color::Indexed(i) => Some(Color::Indexed(i)),
+        ansi::Color::Named(n) => {
+            let n = n as usize;
+            let dim = NamedColor::DimBlack as usize;
+            match n {
+                0..16 => Some(Color::Indexed(n as u8)),
+                _ if (dim..dim + 8).contains(&n) => Some(Color::Indexed((n - dim) as u8)),
+                _ => None,
             }
         }
     }
-    out
 }
 
-fn function_key(n: u8) -> Key {
-    const KEYS: [Key; 12] = [
-        Key::F1, Key::F2, Key::F3, Key::F4, Key::F5, Key::F6,
-        Key::F7, Key::F8, Key::F9, Key::F10, Key::F11, Key::F12,
+fn style_of(cell: &Cell) -> CellStyle {
+    const ATTRS: [(Flags, u8); 7] = [
+        (Flags::BOLD, protocol::ATTR_BOLD),
+        (Flags::ITALIC, protocol::ATTR_ITALIC),
+        (Flags::ALL_UNDERLINES, protocol::ATTR_UNDERLINE),
+        (Flags::INVERSE, protocol::ATTR_INVERSE),
+        (Flags::DIM, protocol::ATTR_FAINT),
+        (Flags::STRIKEOUT, protocol::ATTR_STRIKE),
+        (Flags::HIDDEN, protocol::ATTR_INVISIBLE),
     ];
-    KEYS.get(n.saturating_sub(1) as usize).copied().unwrap_or(Key::Unidentified)
+    let a = ATTRS.iter().filter(|(f, _)| cell.flags.intersects(*f)).fold(0, |a, (_, bit)| a | bit);
+    CellStyle { fg: color_of(cell.fg), bg: color_of(cell.bg), a }
 }
 
-/// Map a character to the US-layout physical key that produces it.
-fn physical_key(c: char) -> (Key, Option<char>) {
-    const LETTERS: [Key; 26] = [
-        Key::A, Key::B, Key::C, Key::D, Key::E, Key::F, Key::G, Key::H, Key::I,
-        Key::J, Key::K, Key::L, Key::M, Key::N, Key::O, Key::P, Key::Q, Key::R,
-        Key::S, Key::T, Key::U, Key::V, Key::W, Key::X, Key::Y, Key::Z,
-    ];
-    const DIGITS: [Key; 10] = [
-        Key::Digit0, Key::Digit1, Key::Digit2, Key::Digit3, Key::Digit4,
-        Key::Digit5, Key::Digit6, Key::Digit7, Key::Digit8, Key::Digit9,
-    ];
-    let lower = c.to_ascii_lowercase();
-    if lower.is_ascii_lowercase() {
-        return (LETTERS[(lower as u8 - b'a') as usize], Some(lower));
-    }
-    if c.is_ascii_digit() {
-        return (DIGITS[(c as u8 - b'0') as usize], Some(c));
-    }
-    let (key, base) = match c {
-        ' ' => (Key::Space, ' '),
-        '`' | '~' => (Key::Backquote, '`'),
-        '\\' | '|' => (Key::Backslash, '\\'),
-        '[' | '{' => (Key::BracketLeft, '['),
-        ']' | '}' => (Key::BracketRight, ']'),
-        ',' | '<' => (Key::Comma, ','),
-        '=' | '+' => (Key::Equal, '='),
-        '-' | '_' => (Key::Minus, '-'),
-        '.' | '>' => (Key::Period, '.'),
-        '\'' | '"' => (Key::Quote, '\''),
-        ';' | ':' => (Key::Semicolon, ';'),
-        '/' | '?' => (Key::Slash, '/'),
-        '!' => (Key::Digit1, '1'),
-        '@' => (Key::Digit2, '2'),
-        '#' => (Key::Digit3, '3'),
-        '$' => (Key::Digit4, '4'),
-        '%' => (Key::Digit5, '5'),
-        '^' => (Key::Digit6, '6'),
-        '&' => (Key::Digit7, '7'),
-        '*' => (Key::Digit8, '8'),
-        '(' => (Key::Digit9, '9'),
-        ')' => (Key::Digit0, '0'),
-        _ => return (Key::Unidentified, None),
-    };
-    (key, Some(base))
+/// The cells of one line: (column, grapheme, cell), skipping wide-char
+/// spacers.
+fn line_cells(emu: &Emu, line: Line) -> impl Iterator<Item = (u16, String, &Cell)> {
+    let row = &emu.term.grid()[line];
+    (0..emu.term.columns()).filter_map(move |x| {
+        let cell = &row[Column(x)];
+        if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            return None;
+        }
+        let mut grapheme = String::from(cell.c);
+        grapheme.extend(cell.zerowidth().into_iter().flatten());
+        Some((x as u16, grapheme, cell))
+    })
 }
 
-fn encode_wheel(emu: &mut Emu, delta: i32, col: u16, row: u16) -> Vec<u8> {
-    let cols = emu.term.cols().unwrap_or(80) as u32;
-    let rows = emu.term.rows().unwrap_or(24) as u32;
-    emu.mouse.set_options_from_terminal(&emu.term).set_size(mouse::EncoderSize {
-        screen_width: cols,
-        screen_height: rows,
-        cell_width: 1,
-        cell_height: 1,
-        padding_top: 0,
-        padding_bottom: 0,
-        padding_right: 0,
-        padding_left: 0,
-    });
-    let button = if delta < 0 { mouse::Button::Four } else { mouse::Button::Five };
-    emu.mouse_event
-        .set_action(mouse::Action::Press)
-        .set_button(Some(button))
-        .set_mods(Mods::empty())
-        .set_position(libghostty_vt::ffi::MousePosition {
-            x: col as f32 + 0.5,
-            y: row as f32 + 0.5,
-        });
-    let mut out = Vec::new();
-    for _ in 0..delta.unsigned_abs().min(10) {
-        let _ = emu.mouse.encode_to_vec(&emu.mouse_event, &mut out);
-    }
-    out
+/// The grid lines currently in the viewport, top to bottom.
+fn viewport_lines(emu: &Emu) -> impl Iterator<Item = Line> {
+    let offset = emu.term.grid().display_offset() as i32;
+    (0..emu.term.screen_lines() as i32).map(move |y| Line(y - offset))
 }
 
-fn color_of(c: StyleColor) -> Option<Color> {
-    match c {
-        StyleColor::None => None,
-        StyleColor::Palette(i) => Some(Color::Indexed(i.0)),
-        StyleColor::Rgb(rgb) => Some(Color::Rgb([rgb.r, rgb.g, rgb.b])),
-    }
-}
-
-fn snapshot(emu: &mut Emu) -> anyhow::Result<Screen> {
-    let scrollbar = emu.term.scrollbar().ok();
-    let snap = emu.render.update(&emu.term)?;
-    let cols = snap.cols()?;
-    let rows = snap.rows()?;
-    let cursor = if snap.cursor_visible()? {
-        snap.cursor_viewport()?.map(|c| (c.x, c.y))
+fn snapshot(emu: &Emu) -> Screen {
+    let cols = emu.term.columns() as u16;
+    let rows = emu.term.screen_lines() as u16;
+    let offset = emu.term.grid().display_offset();
+    let cursor = if emu.term.mode().contains(TermMode::SHOW_CURSOR) {
+        let point = emu.term.grid().cursor.point;
+        let y = point.line.0 + offset as i32;
+        (0..rows as i32).contains(&y).then_some((point.column.0 as u16, y as u16))
     } else {
         None
     };
@@ -463,87 +575,35 @@ fn snapshot(emu: &mut Emu) -> anyhow::Result<Screen> {
     let mut styles: Vec<CellStyle> = vec![CellStyle::default()];
     let mut style_ids: HashMap<CellStyle, u16> = HashMap::from([(CellStyle::default(), 0)]);
     let mut lines = Vec::with_capacity(rows as usize);
-    let mut grapheme = String::new();
 
-    let mut row_iter = emu.rows_it.update(&snap)?;
-    while let Some(row) = row_iter.next() {
+    for line in viewport_lines(emu) {
         let mut spans: Vec<Span> = Vec::new();
-        let mut cell_iter = emu.cells_it.update(row)?;
-        let mut x: u16 = 0;
-        while let Some(cell) = cell_iter.next() {
-            let col = x;
-            x += 1;
-            let raw = cell.raw_cell()?;
-            if matches!(raw.wide()?, CellWide::SpacerTail | CellWide::SpacerHead) {
-                continue;
-            }
-            let style = if cell.has_styling()? { cell.style()? } else { Default::default() };
-            let mut a = 0u8;
-            if style.bold {
-                a |= protocol::ATTR_BOLD;
-            }
-            if style.italic {
-                a |= protocol::ATTR_ITALIC;
-            }
-            if style.underline != Underline::None {
-                a |= protocol::ATTR_UNDERLINE;
-            }
-            if style.inverse {
-                a |= protocol::ATTR_INVERSE;
-            }
-            if style.faint {
-                a |= protocol::ATTR_FAINT;
-            }
-            if style.strikethrough {
-                a |= protocol::ATTR_STRIKE;
-            }
-            if style.invisible {
-                a |= protocol::ATTR_INVISIBLE;
-            }
-            // Background-only cells (e.g. erased with a colored bg) carry
-            // their color in the cell content rather than a style.
-            let bg = match raw.content_tag()? {
-                CellContentTag::BgColorPalette => Some(Color::Indexed(raw.bg_color_palette()?.0)),
-                CellContentTag::BgColorRgb => {
-                    let rgb = raw.bg_color_rgb()?;
-                    Some(Color::Rgb([rgb.r, rgb.g, rgb.b]))
-                }
-                _ => color_of(style.bg_color),
-            };
-            let cs = CellStyle { fg: color_of(style.fg_color), bg, a };
+        for (col, grapheme, cell) in line_cells(emu, line) {
+            let cs = style_of(cell);
             let sid = *style_ids.entry(cs).or_insert_with(|| {
                 styles.push(cs);
                 (styles.len() - 1) as u16
             });
-
-            grapheme.clear();
-            if cell.graphemes_len()? > 0 {
-                cell.graphemes_utf8(&mut grapheme)?;
-            }
-            if grapheme.is_empty() {
-                grapheme.push(' ');
-            }
-
             match spans.last_mut() {
                 Some(last) if last.s == sid && !is_wide(&grapheme) && last_is_narrow(last) => {
                     last.t.push_str(&grapheme)
                 }
-                _ => spans.push(Span { x: col, t: grapheme.clone(), s: sid }),
+                _ => spans.push(Span { x: col, t: grapheme, s: sid }),
             }
         }
         // Drop trailing unstyled whitespace to keep frames small.
         if let Some(last) = spans.last_mut()
-            && last.s == 0 {
-                let trimmed = last.t.trim_end().len();
-                last.t.truncate(trimmed);
-                if last.t.is_empty() {
-                    spans.pop();
-                }
+            && last.s == 0
+        {
+            let trimmed = last.t.trim_end().len();
+            last.t.truncate(trimmed);
+            if last.t.is_empty() {
+                spans.pop();
             }
+        }
         lines.push(spans);
     }
-    let scrolled = scrollbar.map(|s| s.offset + s.len < s.total).unwrap_or(false);
-    Ok(Screen { cols, rows, styles, lines, cursor, scrolled })
+    Screen { cols, rows, styles, lines, cursor, scrolled: offset > 0 }
 }
 
 fn is_wide(g: &str) -> bool {
@@ -551,52 +611,97 @@ fn is_wide(g: &str) -> bool {
 }
 
 /// Spans are kept narrow-only so that column positions stay exact even if
-/// the viewer's width tables disagree with libghostty's.
+/// the viewer's width tables disagree with the emulator's.
 fn last_is_narrow(span: &Span) -> bool {
     span.t.chars().last().map(|c| !is_wide(&c.to_string())).unwrap_or(true)
 }
 
-fn viewport_text(emu: &mut Emu) -> String {
-    let Ok(snap) = emu.render.update(&emu.term) else { return String::new() };
+/// The visible screen as plain text, one line per row.
+fn viewport_text(emu: &Emu) -> String {
     let mut out = String::new();
-    let mut grapheme = String::new();
-    let Ok(mut row_iter) = emu.rows_it.update(&snap) else { return out };
-    while let Some(row) = row_iter.next() {
-        let mut line = String::new();
-        if let Ok(mut cells) = emu.cells_it.update(row) {
-            while let Some(cell) = cells.next() {
-                let wide = cell.raw_cell().and_then(|c| c.wide()).unwrap_or(CellWide::Narrow);
-                if matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead) {
-                    continue;
-                }
-                grapheme.clear();
-                if cell.graphemes_len().unwrap_or(0) > 0 {
-                    let _ = cell.graphemes_utf8(&mut grapheme);
-                }
-                line.push_str(if grapheme.is_empty() { " " } else { &grapheme });
-            }
-        }
-        out.push_str(line.trim_end());
+    for line in viewport_lines(emu) {
+        let text: String = line_cells(emu, line).map(|(_, g, _)| g).collect();
+        out.push_str(text.trim_end());
         out.push('\n');
     }
+    finish_text(out)
+}
+
+/// The screen (and optionally the scrollback) with soft-wrapped lines
+/// joined, as plain text or with SGR escapes.
+fn format_screen(emu: &Emu, scrollback: bool, ansi: bool) -> String {
+    let lines: Vec<Line> = if scrollback {
+        let grid = emu.term.grid();
+        (grid.topmost_line().0..=grid.bottommost_line().0).map(Line).collect()
+    } else {
+        viewport_lines(emu).collect()
+    };
+    let mut out = String::new();
+    let mut logical: Vec<(String, CellStyle)> = Vec::new();
+    for line in lines {
+        let mut wrapped = false;
+        for (_, grapheme, cell) in line_cells(emu, line) {
+            wrapped = cell.flags.contains(Flags::WRAPLINE);
+            logical.push((grapheme, if ansi { style_of(cell) } else { CellStyle::default() }));
+        }
+        if wrapped {
+            continue;
+        }
+        while logical.last().is_some_and(|(g, s)| g == " " && *s == CellStyle::default()) {
+            logical.pop();
+        }
+        let mut current = CellStyle::default();
+        for (grapheme, style) in logical.drain(..) {
+            if style != current {
+                out.push_str(&sgr(&style));
+                current = style;
+            }
+            out.push_str(&grapheme);
+        }
+        if current != CellStyle::default() {
+            out.push_str("\x1b[0m");
+        }
+        out.push('\n');
+    }
+    finish_text(out)
+}
+
+/// Drop trailing blank lines, leaving a single final newline.
+fn finish_text(mut out: String) -> String {
     let trimmed = out.trim_end_matches('\n').len();
     out.truncate(trimmed);
     out.push('\n');
     out
 }
 
-fn format_screen(emu: &mut Emu, format: Format) -> String {
-    let opts = FormatterOptions::new().with_format(format).with_trim(true).with_unwrap(true);
-    match Formatter::new(&emu.term, opts).and_then(|mut f| f.format_len().map(|n| (f, n))) {
-        Ok((mut f, n)) => {
-            let mut buf = vec![0u8; n];
-            match f.format_buf(&mut buf) {
-                Ok(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
-                Err(_) => String::new(),
-            }
+/// The escape sequence that switches to `style` from any other style.
+fn sgr(style: &CellStyle) -> String {
+    let mut s = String::from("\x1b[0");
+    const ATTRS: [(u8, u8); 7] = [
+        (protocol::ATTR_BOLD, 1),
+        (protocol::ATTR_FAINT, 2),
+        (protocol::ATTR_ITALIC, 3),
+        (protocol::ATTR_UNDERLINE, 4),
+        (protocol::ATTR_INVERSE, 7),
+        (protocol::ATTR_INVISIBLE, 8),
+        (protocol::ATTR_STRIKE, 9),
+    ];
+    for (bit, code) in ATTRS {
+        if style.a & bit != 0 {
+            let _ = write!(s, ";{code}");
         }
-        Err(_) => String::new(),
     }
+    for (color, base, extended) in [(style.fg, 30, 38), (style.bg, 40, 48)] {
+        match color {
+            Some(Color::Indexed(i @ 0..8)) => _ = write!(s, ";{}", base + i),
+            Some(Color::Indexed(i @ 8..16)) => _ = write!(s, ";{}", base + 60 + i - 8),
+            Some(Color::Indexed(i)) => _ = write!(s, ";{extended};5;{i}"),
+            Some(Color::Rgb([r, g, b])) => _ = write!(s, ";{extended};2;{r};{g};{b}"),
+            None => {}
+        }
+    }
+    s.push('m');
+    s
 }
 
 /// Whether Claude's footer lists running background work, e.g.
@@ -642,6 +747,7 @@ pub fn detect_prompt(screen: &str) -> Option<String> {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,22 +765,7 @@ mod tests {
         }
         let buf = Arc::new(Mutex::new(Vec::new()));
         let writer: PtyWriter = Arc::new(Mutex::new(Box::new(Sink(buf.clone()))));
-        let emu = Emu {
-            term: {
-                let mut term = Terminal::new(40, 6).unwrap();
-                term.set_scrollback_max_lines(Some(100)).unwrap();
-                term
-            },
-            render: RenderState::new().unwrap(),
-            rows_it: RowIterator::new().unwrap(),
-            cells_it: CellIterator::new().unwrap(),
-            keys: key::Encoder::new().unwrap(),
-            key_event: key::Event::new().unwrap(),
-            mouse: mouse::Encoder::new().unwrap(),
-            mouse_event: mouse::Event::new().unwrap(),
-            writer,
-        };
-        (emu, buf)
+        (Emu::new(40, 6, 100, writer), buf)
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> KeyInput {
@@ -683,22 +774,40 @@ mod tests {
 
     #[test]
     fn encodes_keys() {
+        let legacy = TermMode::default();
+        assert_eq!(encode_key(legacy, &key(KeyCode::Char('a'), false, false, false)), b"a");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Char('A'), false, false, true)), b"A");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Char('c'), true, false, false)), b"\x03");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Char('b'), false, true, false)), b"\x1bb");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Enter, false, false, false)), b"\r");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Up, false, false, false)), b"\x1b[A");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Char('é'), false, false, false)), "é".as_bytes());
+        assert_eq!(encode_key(legacy, &key(KeyCode::Backspace, false, false, false)), b"\x7f");
+        assert_eq!(encode_key(legacy, &key(KeyCode::BackTab, false, false, false)), b"\x1b[Z");
+        assert_eq!(encode_key(legacy, &key(KeyCode::Left, true, false, false)), b"\x1b[1;5D");
+        assert_eq!(encode_key(legacy, &key(KeyCode::F(5), false, false, false)), b"\x1b[15~");
+        let app = legacy | TermMode::APP_CURSOR;
+        assert_eq!(encode_key(app, &key(KeyCode::Up, false, false, false)), b"\x1bOA");
+    }
+
+    #[test]
+    fn encodes_kitty_keys() {
         let (mut emu, _) = test_emu();
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Char('a'), false, false, false)), b"a");
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Char('A'), false, false, true)), b"A");
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Char('c'), true, false, false)), b"\x03");
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Char('b'), false, true, false)), b"\x1bb");
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Enter, false, false, false)), b"\r");
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Up, false, false, false)), b"\x1b[A");
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Char('é'), false, false, false)), "é".as_bytes());
-        assert_eq!(encode_key(&mut emu, &key(KeyCode::Backspace, false, false, false)), b"\x7f");
+        emu.vt_write(b"\x1b[>1u");
+        let mode = *emu.term.mode();
+        assert!(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(encode_key(mode, &key(KeyCode::Enter, false, false, true)), b"\x1b[13;2u");
+        assert_eq!(encode_key(mode, &key(KeyCode::Enter, false, false, false)), b"\r");
+        assert_eq!(encode_key(mode, &key(KeyCode::Escape, false, false, false)), b"\x1b[27u");
+        assert_eq!(encode_key(mode, &key(KeyCode::Char('c'), true, false, false)), b"\x1b[99;5u");
+        assert_eq!(encode_key(mode, &key(KeyCode::Char('A'), false, false, true)), b"A");
     }
 
     #[test]
     fn snapshots_styles() {
         let (mut emu, _) = test_emu();
-        emu.term.vt_write(b"plain \x1b[1;31mred\x1b[0m\r\n\xe4\xbd\xa0\xe5\xa5\xbd!");
-        let s = snapshot(&mut emu).unwrap();
+        emu.vt_write(b"plain \x1b[1;31mred\x1b[0m\r\n\xe4\xbd\xa0\xe5\xa5\xbd!");
+        let s = snapshot(&emu);
         assert_eq!(s.cols, 40);
         assert_eq!(s.lines[0][0].t, "plain ");
         assert_eq!(s.lines[0][1].t, "red");
@@ -708,22 +817,71 @@ mod tests {
         assert!(red.a & protocol::ATTR_BOLD != 0);
         let texts: Vec<_> = s.lines[1].iter().map(|sp| (sp.x, sp.t.as_str())).collect();
         assert_eq!(texts, vec![(0, "你"), (2, "好"), (4, "!")]);
-        assert_eq!(viewport_text(&mut emu), "plain red\n你好!\n");
+        assert_eq!(s.cursor, Some((5, 1)));
+        assert_eq!(viewport_text(&emu), "plain red\n你好!\n");
+    }
+
+    #[test]
+    fn keeps_erased_background() {
+        let (mut emu, _) = test_emu();
+        emu.vt_write(b"\x1b[44m\x1b[K\x1b[0m");
+        let s = snapshot(&emu);
+        let bg = s.styles[s.lines[0][0].s as usize].bg;
+        assert_eq!(bg, Some(Color::Indexed(4)));
     }
 
     #[test]
     fn answers_queries() {
         let (mut emu, out) = test_emu();
-        emu.term
-            .on_pty_write({
-                let w = emu.writer.clone();
-                move |_t, d| {
-                    w.lock().unwrap().write_all(d).unwrap();
-                }
-            })
-            .unwrap();
-        emu.term.vt_write(b"\x1b[6n");
+        emu.vt_write(b"\x1b[6n");
         assert_eq!(out.lock().unwrap().as_slice(), b"\x1b[1;1R");
+        out.lock().unwrap().clear();
+        emu.vt_write(b"\x1b]11;?\x07");
+        assert_eq!(out.lock().unwrap().as_slice(), b"\x1b]11;rgb:2828/2c2c/3434\x07");
+    }
+
+    #[test]
+    fn reports_title() {
+        let (mut emu, _) = test_emu();
+        emu.vt_write(b"\x1b]0;\xe2\x9c\xb3 Fix bug\x07");
+        assert_eq!(emu.title.take().map(|t| clean_title(&t)).as_deref(), Some("Fix bug"));
+    }
+
+    #[test]
+    fn scrolls_and_formats_history() {
+        let (mut emu, _) = test_emu();
+        for i in 0..10 {
+            emu.vt_write(format!("line {i}\r\n").as_bytes());
+        }
+        emu.vt_write(&[b'x'; 45]);
+        assert!(viewport_text(&emu).starts_with("line 6\n"));
+        handle(&mut emu, Msg::Scroll { delta: -3, col: 0, row: 0 });
+        assert!(snapshot(&emu).scrolled);
+        assert!(viewport_text(&emu).starts_with("line 3\n"));
+        handle(&mut emu, Msg::ScrollReset);
+        let all = format_screen(&emu, true, false);
+        assert!(all.starts_with("line 0\n"));
+        assert!(all.ends_with(&format!("line 9\n{}\n", "x".repeat(45))));
+        emu.vt_write(b"\r\n\x1b[32mok\x1b[0m");
+        assert!(format_screen(&emu, false, true).ends_with("\x1b[0;32mok\x1b[0m\n"));
+    }
+
+    #[test]
+    fn holds_synchronized_updates() {
+        let (mut emu, _) = test_emu();
+        emu.vt_write(b"\x1b[?2026hhidden");
+        assert_eq!(viewport_text(&emu), "\n");
+        assert!(emu.sync_deadline().is_some());
+        emu.vt_write(b"\x1b[?2026l");
+        assert_eq!(viewport_text(&emu), "hidden\n");
+    }
+
+    #[test]
+    fn encodes_paste_and_wheel() {
+        assert_eq!(encode_paste("a\nb", false), b"a\rb");
+        assert_eq!(encode_paste("a\x1b[201~b", true), b"\x1b[200~a[201~b\x1b[201~");
+        let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(encode_wheel(sgr, -2, 3, 4), b"\x1b[<64;4;5M\x1b[<64;4;5M");
     }
 
     #[test]
