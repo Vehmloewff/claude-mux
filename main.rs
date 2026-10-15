@@ -41,7 +41,10 @@ SESSION STATES
   needs-input  a permission prompt, trust dialog or other choice is on screen
   background   turn ended, but background shells/agents are still running;
                claude resumes by itself when they finish (`wait` keeps waiting)
-  idle         turn finished, nothing running; waiting for the next message
+  idle         turn finished, nothing running; waiting for the next message.
+               After a few seconds idle, claude's process is stopped to save
+               memory (asleep) and resumed automatically by the next
+               `send` or `keys` (CLAUDE_MUX_SLEEP_AFTER=<secs>|never)
   exited       the claude process ended on its own
   stopped      killed or the daemon restarted; `claude-mux resume` continues it
 
@@ -481,7 +484,8 @@ fn print_details(s: &SessionInfo) {
         println!("title:     {t}");
     }
     let detail = s.status_detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
-    println!("status:    {}{}", s.effective_status().label(), detail);
+    let asleep = if s.asleep { " (asleep)" } else { "" };
+    println!("status:    {}{asleep}{}", s.effective_status().label(), detail);
     println!("cwd:       {}", s.cwd);
     println!("created:   {} ago", ago(s.created_at));
     println!("turns:     {}", s.turns);

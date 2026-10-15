@@ -493,7 +493,7 @@ impl App {
                 });
             }
             CtKey::Char('r') => {
-                if s.status.is_live() {
+                if s.status.is_live() && !s.asleep {
                     self.flash("session is already running", true);
                 } else {
                     self.command(Request::Resume { id: s.id.clone() }, format!("resumed {}", s.id), false);
@@ -609,7 +609,10 @@ impl App {
         }
     }
 
-    fn status_icon(&self, status: Status) -> (String, Style) {
+    fn status_icon(&self, status: Status, asleep: bool) -> (String, Style) {
+        if asleep && status == Status::Idle {
+            return ("○".into(), Style::new().fg(TColor::Green));
+        }
         let tick = (self.started.elapsed().as_millis() / 100) as usize;
         match status {
             Status::Starting => ("◌".into(), Style::new().fg(TColor::DarkGray)),
@@ -673,7 +676,7 @@ impl App {
             f.buffer_mut().set_style(row, base);
 
             let status = s.effective_status();
-            let (icon, icon_style) = self.status_icon(status);
+            let (icon, icon_style) = self.status_icon(status, s.asleep);
             let label = status.label();
             let num = if i < 9 { format!("{}", i + 1) } else { " ".into() };
             let name_w = width.saturating_sub(label.len() + 6);
@@ -718,7 +721,7 @@ impl App {
         let border = if focused { Style::new().fg(TColor::Cyan) } else { Style::new().fg(TColor::DarkGray) };
         let mut block = Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(border);
         if let Some(s) = &session {
-            let (icon, icon_style) = self.status_icon(s.effective_status());
+            let (icon, icon_style) = self.status_icon(s.effective_status(), s.asleep);
             let mut title = vec![
                 TSpan::raw(" "),
                 TSpan::styled(icon, icon_style),
@@ -909,7 +912,8 @@ impl App {
                     TSpan::raw("◷ ").fg(TColor::Blue), TSpan::raw("background tasks"),
                 ]));
                 lines.push(Line::from(vec![
-                    TSpan::raw("● ").fg(TColor::Green), TSpan::raw("idle      "),
+                    TSpan::raw("● ").fg(TColor::Green), TSpan::raw("idle  "),
+                    TSpan::raw("○ ").fg(TColor::Green), TSpan::raw("asleep  "),
                     TSpan::raw("✕ ").fg(TColor::DarkGray), TSpan::raw("exited   "),
                     TSpan::raw("◼ ").fg(TColor::DarkGray), TSpan::raw("stopped"),
                 ]));

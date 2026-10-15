@@ -35,7 +35,7 @@ fn migrations() -> Vec<(&'static str, &'static str)> {
 
 const SESSION_COLUMNS: &str = "id, name, cwd, context, status, status_detail, title, \
     claude_session_id, created_at, updated_at, exit_code, turns, last_message, \
-    claude_args, auto_trust, background";
+    claude_args, auto_trust, background, asleep";
 
 /// The async Turso API driven synchronously: local file IO completes inline,
 /// so there is no reactor to run.
@@ -126,7 +126,7 @@ impl Db {
     pub fn save_sessions<'a>(&self, infos: impl IntoIterator<Item = &'a SessionInfo>) -> Result<()> {
         let insert = format!(
             "INSERT INTO sessions ({SESSION_COLUMNS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         );
         let rows = infos.into_iter().map(session_params).collect::<Result<Vec<_>>>()?;
         block_on(async {
@@ -182,6 +182,7 @@ fn session_params(info: &SessionInfo) -> Result<Vec<Value>> {
         Value::Text(serde_json::to_string(&info.claude_args)?),
         Value::Integer(info.auto_trust.into()),
         Value::Text(serde_json::to_string(&info.background)?),
+        Value::Integer(info.asleep.into()),
     ])
 }
 
@@ -206,6 +207,7 @@ fn session_from_row(row: &turso::Row) -> Result<SessionInfo> {
         claude_args: serde_json::from_str(&row.get::<String>(13)?)?,
         auto_trust: row.get::<i64>(14)? != 0,
         background: serde_json::from_str(&row.get::<String>(15)?)?,
+        asleep: row.get::<i64>(16)? != 0,
     })
 }
 
@@ -240,6 +242,7 @@ mod tests {
             claude_args: vec!["--model".into(), "opus".into()],
             auto_trust: true,
             background: vec![BackgroundTask { id: "b1".into(), kind: "shell".into(), description: "npm test".into() }],
+            asleep: true,
         }
     }
 
@@ -262,6 +265,7 @@ mod tests {
         assert_eq!(s.queued, 0);
         assert_eq!(s.claude_args, ["--model", "opus"]);
         assert!(s.auto_trust);
+        assert!(s.asleep);
         assert_eq!(s.background[0].description, "npm test");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

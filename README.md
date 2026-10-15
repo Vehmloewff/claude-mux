@@ -65,6 +65,7 @@ still running, with exit code `4`.
 | ◆ | needs-input | a permission prompt, trust dialog or similar is waiting for a person |
 | ◷ | background | the turn ended, but background shells/agents are still running; claude resumes when they finish, so `wait` keeps waiting |
 | ● | idle | the turn is finished, nothing is running, and claude is waiting for the next message |
+| ○ | idle (asleep) | idle, with claude's process stopped to save memory. The next `send`, `keys` or keystroke in the TUI resumes it (`claude --resume`) and delivers the input |
 | ✕ | exited | the claude process ended on its own |
 | ◼ | stopped | killed or the daemon restarted; `resume` continues the conversation |
 
@@ -115,8 +116,16 @@ directory and age. The right pane shows the selected session's terminal.
   also scans the emulated screen for them.
 - **Sending.** Messages are pasted into claude as a bracketed paste followed
   by Enter, once the session is idle, so each one becomes its own turn.
+- **Sleeping.** A claude process uses a lot of memory, so once a session has
+  been idle for 5 seconds (no background tasks, dialogs or queued messages),
+  the daemon stops its process and marks it `asleep`. The
+  next message or keystroke restarts it with `claude --resume` and delivers the
+  input once claude is back at its prompt. Sessions with no completed turn
+  yet stay awake, since there's nothing to resume. Keys typed without
+  submitting a prompt keep a session awake for 10 minutes, so drafts in
+  claude's input box aren't lost.
 
 Environment variables: `CLAUDE_MUX_HOME` sets the directory holding `state.db`, the log and the socket,
 `CLAUDE_MUX_SOCKET` sets the socket path, `CLAUDE_MUX_CLAUDE_BIN` sets the
-claude binary, and `CLAUDE_MUX_DEBUG=1` makes `claude-muxd` log every hook payload. Inside a session, `CLAUDE_MUX_SESSION_ID` is set and `claude-mux` is
+claude binary, `CLAUDE_MUX_SLEEP_AFTER` sets the idle seconds before a session sleeps (`never` turns sleeping off), and `CLAUDE_MUX_DEBUG=1` makes `claude-muxd` log every hook payload. Inside a session, `CLAUDE_MUX_SESSION_ID` is set and `claude-mux` is
 on `PATH`.

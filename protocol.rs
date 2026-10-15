@@ -86,6 +86,10 @@ pub struct SessionInfo {
     /// Background tasks still running when the last turn ended.
     #[serde(default)]
     pub background: Vec<BackgroundTask>,
+    /// Idle with its claude process stopped to save memory; the daemon
+    /// resumes it when it is sent a message or keys.
+    #[serde(default)]
+    pub asleep: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -21,6 +21,22 @@ use crate::term::{PtyWriter, TRUST_PROMPT, TermEvent, TermHandle};
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 40;
 
+/// How long a session must sit idle before its claude process is stopped to
+/// save memory. `CLAUDE_MUX_SLEEP_AFTER` overrides it (seconds, or `never`).
+const DEFAULT_SLEEP_AFTER: Duration = Duration::from_secs(5);
+
+/// Typed input that hasn't been submitted (a draft in claude's prompt)
+/// keeps a session awake this long, since sleeping would lose it.
+const DRAFT_GRACE: Duration = Duration::from_secs(10 * 60);
+
+fn sleep_after() -> Option<Duration> {
+    match std::env::var("CLAUDE_MUX_SLEEP_AFTER") {
+        Err(_) => Some(DEFAULT_SLEEP_AFTER),
+        Ok(v) if matches!(v.trim(), "never" | "off") => None,
+        Ok(v) => Some(v.trim().parse().map(Duration::from_secs_f64).unwrap_or(DEFAULT_SLEEP_AFTER)),
+    }
+}
+
 /// Env vars that make claude think it is nested inside another session.
 const STRIP_ENV: &[&str] = &[
     "CLAUDECODE",
@@ -63,6 +79,70 @@ struct Session {
     /// When the footer stopped showing background tasks while we were in
     /// `Background` (a fallback if claude never wakes up).
     background_cleared: Option<Instant>,
+    /// When the session became idle enough to sleep (reset by any input).
+    idle_since: Option<Instant>,
+    /// When keys were last typed without a prompt being submitted since.
+    draft_at: Option<Instant>,
+    /// The process is being stopped to put the session to sleep.
+    falling_asleep: bool,
+    /// Keys and pastes that arrived while asleep, typed once claude is back.
+    wake_input: Vec<WakeInput>,
+    /// Whether claude has a saved conversation that `--resume` can load
+    /// (not the case before the first turn, or right after `/clear`).
+    resumable: bool,
+}
+
+enum WakeInput {
+    Key(KeyInput),
+    Paste(String),
+}
+
+impl Session {
+    fn new(info: SessionInfo) -> Self {
+        Session {
+            resumable: info.turns > 0,
+            info,
+            proc: None,
+            term: None,
+            size: (DEFAULT_COLS, DEFAULT_ROWS),
+            queue: VecDeque::new(),
+            screen_gen: 0,
+            awaiting_submit: None,
+            screen_prompt: None,
+            status_before_prompt: None,
+            initial_pending: false,
+            last_hook: None,
+            killed: false,
+            background_cleared: None,
+            idle_since: None,
+            draft_at: None,
+            falling_asleep: false,
+            wake_input: Vec::new(),
+        }
+    }
+
+    /// The claude process is (supposed to be) alive.
+    fn running(&self) -> bool {
+        self.info.status.is_live() && !self.info.asleep
+    }
+
+    /// Idle with nothing pending, so the process can be stopped and later
+    /// resumed without losing anything.
+    fn can_sleep(&self) -> bool {
+        self.proc.is_some()
+            && !self.info.asleep
+            && !self.falling_asleep
+            && !self.killed
+            && self.resumable
+            && self.info.status == Status::Idle
+            && self.info.background.is_empty()
+            && self.queue.is_empty()
+            && self.wake_input.is_empty()
+            && self.awaiting_submit.is_none()
+            && self.screen_prompt.is_none()
+            && self.background_cleared.is_none()
+            && self.draft_at.is_none_or(|t| t.elapsed() > DRAFT_GRACE)
+    }
 }
 
 struct Inner {
@@ -151,29 +231,13 @@ pub fn run() -> Result<Started> {
 fn load_sessions(db: &Db) -> Result<BTreeMap<String, Session>> {
     let mut map = BTreeMap::new();
     for mut info in db.load_sessions().context("load sessions")? {
-        if info.status.is_live() {
+        // Asleep sessions stay asleep: they wake on the next message.
+        if info.status.is_live() && !info.asleep {
             info.status = Status::Stopped;
             info.status_detail = Some("daemon restarted; resume to continue".into());
         }
         info.queued = 0;
-        map.insert(
-            info.id.clone(),
-            Session {
-                info,
-                proc: None,
-                term: None,
-                size: (DEFAULT_COLS, DEFAULT_ROWS),
-                queue: VecDeque::new(),
-                screen_gen: 0,
-                awaiting_submit: None,
-                screen_prompt: None,
-                status_before_prompt: None,
-                initial_pending: false,
-                last_hook: None,
-                killed: false,
-                background_cleared: None,
-            },
-        );
+        map.insert(info.id.clone(), Session::new(info));
     }
     Ok(map)
 }
@@ -267,7 +331,14 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             if !s.info.status.is_live() {
                 bail!("session '{id}' is {}; resume it first", s.info.status.label());
             }
-            if now {
+            if s.info.asleep || s.falling_asleep {
+                // Typed once claude is back at its prompt.
+                s.queue.push_back(message);
+                s.info.queued = s.queue.len();
+                if s.info.asleep {
+                    wake(d, s)?;
+                }
+            } else if now {
                 type_message(s, message);
             } else {
                 s.queue.push_back(message);
@@ -302,9 +373,13 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             if let Some(p) = s.proc.as_mut() {
                 s.killed = true;
                 let _ = p.killer.kill();
+            } else if s.info.asleep {
+                s.info.asleep = false;
+                set_status(s, Status::Stopped, Some("killed; resume to continue".into()));
             }
             s.queue.clear();
             s.info.queued = 0;
+            s.wake_input.clear();
             d.touch(&mut inner);
             Ok(Response::Ok)
         }
@@ -332,7 +407,18 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
         Request::Keys { id, keys } => {
             let term = {
                 let mut inner = d.lock();
-                session_mut(&mut inner, &id)?.term.clone()
+                let s = session_mut(&mut inner, &id)?;
+                if s.info.asleep || s.falling_asleep {
+                    s.wake_input.extend(keys.into_iter().map(WakeInput::Key));
+                    if s.info.asleep {
+                        wake(d, s)?;
+                    }
+                    d.touch(&mut inner);
+                    return Ok(Response::Ok);
+                }
+                s.idle_since = None;
+                s.draft_at = Some(Instant::now());
+                s.term.clone()
             };
             let term = term.ok_or_else(|| anyhow!("session '{id}' is not running"))?;
             for key in keys {
@@ -422,22 +508,10 @@ fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
         claude_args: c.claude_args,
         auto_trust: c.trust,
         background: Vec::new(),
+        asleep: false,
     };
-    let mut session = Session {
-        info,
-        proc: None,
-        term: None,
-        size: (DEFAULT_COLS, DEFAULT_ROWS),
-        queue: VecDeque::new(),
-        screen_gen: 0,
-        awaiting_submit: None,
-        screen_prompt: None,
-        status_before_prompt: None,
-        initial_pending: !c.context.trim().is_empty(),
-        last_hook: None,
-        killed: false,
-        background_cleared: None,
-    };
+    let mut session = Session::new(info);
+    session.initial_pending = !c.context.trim().is_empty();
     if session.initial_pending {
         // Claude can take a while to boot, especially on first run.
         session.awaiting_submit = Some((Instant::now(), Duration::from_secs(90)));
@@ -452,6 +526,12 @@ fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
 fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
     let mut inner = d.lock();
     let s = session_mut(&mut inner, id)?;
+    if s.info.asleep {
+        wake(d, s)?;
+        let info = s.info.clone();
+        d.touch(&mut inner);
+        return Ok(info);
+    }
     if s.info.status.is_live() {
         bail!("session '{id}' is still running");
     }
@@ -464,6 +544,24 @@ fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
     let info = s.info.clone();
     d.touch(&mut inner);
     Ok(info)
+}
+
+/// Restart an asleep session's claude, continuing its conversation. Queued
+/// messages and keys are delivered once it is back at its prompt.
+fn wake(d: &Shared, s: &mut Session) -> Result<()> {
+    s.info.asleep = false;
+    s.idle_since = None;
+    s.initial_pending = false;
+    s.awaiting_submit = None;
+    s.screen_prompt = None;
+    s.info.exit_code = None;
+    set_status(s, Status::Starting, Some("waking up".into()));
+    if let Err(e) = spawn_claude(d, s, true) {
+        s.info.asleep = true;
+        set_status(s, Status::Idle, None);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn claude_bin() -> String {
@@ -547,7 +645,23 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
             let mut inner = d.lock();
             if let Some(s) = inner.sessions.get_mut(&id) {
                 s.proc = None;
+                if std::mem::take(&mut s.falling_asleep) && !s.killed {
+                    s.info.asleep = true;
+                    s.awaiting_submit = None;
+                    s.screen_prompt = None;
+                    set_status(s, Status::Idle, None);
+                    // Something arrived while it was shutting down.
+                    if (!s.queue.is_empty() || !s.wake_input.is_empty())
+                        && !d.shutting_down.load(Ordering::SeqCst)
+                        && let Err(e) = wake(&d, s)
+                    {
+                        eprintln!("[{}] failed to wake {id}: {e:#}", paths::now());
+                    }
+                    d.touch(&mut inner);
+                    return;
+                }
                 s.queue.clear();
+                s.wake_input.clear();
                 s.info.queued = 0;
                 s.info.exit_code = code;
                 s.awaiting_submit = None;
@@ -607,7 +721,7 @@ fn shutdown(d: &Shared) {
     }
     let mut inner = d.lock();
     for s in inner.sessions.values_mut() {
-        if s.info.status.is_live() {
+        if s.running() {
             set_status(s, Status::Stopped, Some("daemon shut down; resume to continue".into()));
         }
     }
@@ -638,7 +752,12 @@ fn type_message(s: &mut Session, message: String) {
 
 fn deliver_if_ready(s: &mut Session) {
     // Claude is at its prompt in both states; a message just starts a turn.
-    if !matches!(s.info.status, Status::Idle | Status::Background) || s.awaiting_submit.is_some() || s.screen_prompt.is_some() {
+    if !matches!(s.info.status, Status::Idle | Status::Background)
+        || s.awaiting_submit.is_some()
+        || s.screen_prompt.is_some()
+        || s.info.asleep
+        || s.falling_asleep
+    {
         return;
     }
     if let Some(msg) = s.queue.pop_front() {
@@ -650,11 +769,27 @@ fn deliver_if_ready(s: &mut Session) {
 /// Periodic housekeeping: recover from messages that never produced a
 /// UserPromptSubmit hook (slash commands, swallowed input, ...).
 fn ticker(d: Shared) {
+    let sleep_after = sleep_after();
     loop {
         std::thread::sleep(Duration::from_millis(500));
         let mut inner = d.lock();
         let mut changed = false;
         for s in inner.sessions.values_mut() {
+            // Stop idle sessions' claude to free its memory; it is resumed
+            // when the session gets a message.
+            if let Some(after) = sleep_after
+                && s.can_sleep()
+            {
+                let since = *s.idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= after
+                    && let Some(p) = s.proc.as_mut()
+                {
+                    s.falling_asleep = true;
+                    let _ = p.killer.kill();
+                }
+            } else {
+                s.idle_since = None;
+            }
             // Background tasks vanished from the footer but claude never woke
             // up for them (e.g. they were killed): the session is idle.
             if let Some(at) = s.background_cleared
@@ -779,15 +914,28 @@ fn on_hook(d: &Shared, id: &str, event: &str, payload: Value) {
         return;
     }
     s.last_hook = Some(Instant::now());
+    // Claude starts a new conversation on `/clear`; follow it so resuming
+    // continues the current one.
+    if let Some(sid) = payload.get("session_id").and_then(Value::as_str)
+        && !sid.is_empty()
+        && sid != s.info.claude_session_id
+    {
+        s.info.claude_session_id = sid.to_string();
+        s.resumable = false;
+    }
     match event {
         "SessionStart" => {
             let source = payload.get("source").and_then(Value::as_str).unwrap_or("");
+            if source == "clear" {
+                s.resumable = false;
+            }
             if (s.info.status == Status::Starting && !s.initial_pending) || source == "clear" {
                 s.awaiting_submit = None;
                 set_status(s, Status::Idle, None);
             }
         }
         "UserPromptSubmit" => {
+            s.draft_at = None;
             s.awaiting_submit = None;
             s.initial_pending = false;
             set_status(s, Status::Working, None);
@@ -815,6 +963,7 @@ fn on_hook(d: &Shared, id: &str, event: &str, payload: Value) {
             s.awaiting_submit = None;
             s.initial_pending = false;
             s.info.turns += 1;
+            s.resumable = true;
             if last_message.is_some() {
                 s.info.last_message = last_message;
             }
@@ -827,10 +976,31 @@ fn on_hook(d: &Shared, id: &str, event: &str, payload: Value) {
         "SessionEnd" => {}
         _ => {}
     }
+    if s.info.status == Status::Idle && !s.wake_input.is_empty() {
+        flush_wake_input(s);
+    }
     if matches!(s.info.status, Status::Idle | Status::Background) {
         deliver_if_ready(s);
     }
     d.touch(&mut inner);
+}
+
+/// Type the keys and pastes that woke the session.
+fn flush_wake_input(s: &mut Session) {
+    let Some(term) = s.term.clone() else { return };
+    let input = std::mem::take(&mut s.wake_input);
+    s.draft_at = Some(Instant::now());
+    // Hold queued messages back briefly so they don't interleave.
+    s.awaiting_submit = Some((Instant::now(), Duration::from_secs(4)));
+    std::thread::spawn(move || {
+        for ev in input {
+            match ev {
+                WakeInput::Key(key) => term.key(key),
+                WakeInput::Paste(text) => term.paste(text),
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    });
 }
 
 /// Background tasks the Stop hook reports as still running.
@@ -985,12 +1155,12 @@ fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
             d.changed.notify_all();
         }
         ClientEvent::Key { id, key } => {
-            if let Some(t) = term_of(&id) {
+            if let Some(t) = input_term(d, &id, || WakeInput::Key(key.clone())) {
                 t.key(key);
             }
         }
         ClientEvent::Paste { id, text } => {
-            if let Some(t) = term_of(&id) {
+            if let Some(t) = input_term(d, &id, || WakeInput::Paste(text.clone())) {
                 t.paste(text);
             }
         }
@@ -1005,4 +1175,24 @@ fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
             }
         }
     }
+}
+
+/// The terminal to type into, or None after buffering the input and waking
+/// the session if it is asleep. Typing keeps a session awake.
+fn input_term(d: &Shared, id: &str, input: impl FnOnce() -> WakeInput) -> Option<TermHandle> {
+    let mut inner = d.lock();
+    let s = inner.sessions.get_mut(id)?;
+    s.idle_since = None;
+    s.draft_at = Some(Instant::now());
+    if !s.info.asleep && !s.falling_asleep {
+        return s.term.clone();
+    }
+    s.wake_input.push(input());
+    if s.info.asleep {
+        if let Err(e) = wake(d, s) {
+            eprintln!("[{}] failed to wake {id}: {e:#}", paths::now());
+        }
+        d.touch(&mut inner);
+    }
+    None
 }
