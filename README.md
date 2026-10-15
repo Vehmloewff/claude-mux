@@ -46,7 +46,7 @@ Everything an agent needs to drive claude-mux is in `claude-mux --help`.
 | `claude-mux send [ID] MESSAGE [--now] [--wait]` | Send a message. It's queued until claude is idle, unless you pass `--now`. With no ID it goes to the newest running session. |
 | `claude-mux wait ID… [--any] [--timeout S] [-q] [--json]` | Block until the sessions settle and print the final reply. |
 | `claude-mux manage [ID]` / `claude-mux attach ID` | Open the TUI, optionally focused on one session. |
-| `claude-mux list` · `status ID` · `peek ID [--ansi]` · `last ID` | Inspect sessions. |
+| `claude-mux list` · `questions` · `status ID` · `peek ID [--ansi]` · `last ID` | Inspect sessions. `questions` lists questions a session is blocked on. `questions answer <question> <n> [--notes TEXT]` records a choice (`1,2,3` for a checkbox); `questions chat <message>` chooses Chat about this; `questions submit` sends recorded choices. |
 | `claude-mux keys ID KEY…` | Press keys, e.g. `claude-mux keys 3f9a1c down enter` to answer a dialog. |
 | `claude-mux kill ID` · `resume ID` · `rm ID…` · `rename ID NAME` | Manage the lifecycle. |
 | `claude-mux shutdown` | Stop the daemon and all sessions. |

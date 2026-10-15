@@ -5,10 +5,12 @@
 //! daemon, which is how claude-mux knows when a session is working, blocked on
 //! a permission prompt, or done with its turn.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::paths;
@@ -63,6 +65,145 @@ pub fn run_hook(event: &str) {
     }
     let mut ack = String::new();
     let _ = BufReader::new(&stream).read_line(&mut ack);
+}
+
+/// One plan-mode question Claude is waiting on. Read from the session
+/// transcript (`AskUserQuestion`), not from the screen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Ask {
+    pub questions: Vec<AskQuestion>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AskQuestion {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multi_select: bool,
+    pub options: Vec<AskOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AskOption {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    /// Set for a screen dialog, where one choice is highlighted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selected: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// `~/.claude/projects/<cwd-with-non-alphanumerics-as-dashes>/<session-id>.jsonl`.
+/// `CLAUDE_CONFIG_DIR` overrides `~/.claude`, matching Claude Code.
+pub fn transcript_path(cwd: &str, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.contains("..") {
+        return None;
+    }
+    let dir: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let home = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/tmp".into()).join(".claude")
+        });
+    Some(home.join("projects").join(dir).join(format!("{session_id}.jsonl")))
+}
+
+/// The `AskUserQuestion` Claude is blocked on, if the transcript has one
+/// with no later tool result.
+pub fn pending_ask_for(cwd: &str, session_id: &str) -> Option<Ask> {
+    let path = transcript_path(cwd, session_id)?;
+    pending_ask(&read_transcript_tail(&path)?)
+}
+
+/// A pending question is the last thing written, so the tail of the file is
+/// enough. Whole transcripts run to tens of megabytes.
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    const MAX: u64 = 1024 * 1024;
+    let truncated = len > MAX;
+    if truncated {
+        file.seek(SeekFrom::Start(len - MAX)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated && let Some(i) = text.find('\n') {
+        text.drain(..=i);
+    }
+    Some(text)
+}
+
+pub fn pending_ask(jsonl: &str) -> Option<Ask> {
+    let mut pending: Option<(String, Ask)> = None;
+    for line in jsonl.lines() {
+        if !line.contains("AskUserQuestion") && !line.contains("tool_result") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(blocks) = entry.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("tool_use") if block.get("name").and_then(|n| n.as_str()) == Some("AskUserQuestion") => {
+                    let Some(id) = block.get("id").and_then(|i| i.as_str()) else { continue };
+                    if let Some(ask) = block.get("input").and_then(parse_ask) {
+                        pending = Some((id.to_string(), ask));
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str())
+                        && pending.as_ref().is_some_and(|(pid, _)| pid == id)
+                    {
+                        pending = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    pending.map(|(_, ask)| ask)
+}
+
+fn parse_ask(input: &Value) -> Option<Ask> {
+    let questions: Vec<_> = input.get("questions")?.as_array()?.iter().filter_map(parse_question).collect();
+    (!questions.is_empty()).then_some(Ask { questions })
+}
+
+fn parse_question(v: &Value) -> Option<AskQuestion> {
+    let question = nonempty(v, "question")?;
+    let options = v
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|opts| opts.iter().filter_map(parse_option).collect())
+        .unwrap_or_default();
+    Some(AskQuestion {
+        header: nonempty(v, "header"),
+        question,
+        multi_select: v.get("multiSelect").and_then(|b| b.as_bool()).unwrap_or(false),
+        options,
+    })
+}
+
+fn parse_option(v: &Value) -> Option<AskOption> {
+    Some(AskOption {
+        label: nonempty(v, "label")?,
+        description: nonempty(v, "description"),
+        preview: nonempty(v, "preview"),
+        selected: false,
+    })
+}
+
+fn nonempty(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// Pull the final assistant text out of a Stop hook payload, falling back
@@ -127,5 +268,46 @@ mod tests {
         assert_eq!(last_assistant_message(&payload).as_deref(), Some("done!"));
         let direct = json!({ "last_assistant_message": "direct", "transcript_path": path });
         assert_eq!(last_assistant_message(&direct).as_deref(), Some("direct"));
+    }
+
+    fn ask_line(id: &str, body: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"AskUserQuestion","input":{body}}}]}}}}"#
+        )
+    }
+
+    fn result_line(id: &str) -> String {
+        format!(r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":"answered"}}]}}}}"#)
+    }
+
+    #[test]
+    fn pending_ask_is_the_unanswered_plan_question() {
+        let body = r#"{"questions":[{"header":"License","question":"Which license?","multiSelect":false,"options":[{"label":"MIT","description":"Short","preview":"MIT text"}]},{"header":"Layout","question":"How should files be laid out?","multiSelect":true,"options":[{"label":"Paired files","description":"up.sql and down.sql"}]}]}"#;
+        let open = format!("{}\n{}\n", ask_line("t1", body), r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{}}]}}"#);
+        let ask = pending_ask(&open).unwrap();
+        assert_eq!(ask.questions.len(), 2);
+        assert_eq!(ask.questions[0].header.as_deref(), Some("License"));
+        assert_eq!(ask.questions[0].question, "Which license?");
+        assert!(!ask.questions[0].multi_select);
+        assert_eq!(ask.questions[0].options[0].label, "MIT");
+        assert_eq!(ask.questions[0].options[0].description.as_deref(), Some("Short"));
+        assert_eq!(ask.questions[0].options[0].preview.as_deref(), Some("MIT text"));
+        assert!(ask.questions[1].multi_select);
+
+        let answered = format!("{}\n{}\n", ask_line("t1", body), result_line("t1"));
+        assert!(pending_ask(&answered).is_none());
+
+        let replaced = format!("{}\n{}\n", ask_line("old", body), ask_line("new", body));
+        assert!(pending_ask(&replaced).is_some());
+        let cleared_old = format!("{}\n{}\n", ask_line("new", body), result_line("old"));
+        assert!(pending_ask(&cleared_old).is_some());
+    }
+
+    #[test]
+    fn transcript_path_encodes_cwd() {
+        let path = transcript_path("/Users/elijah.mooring/Projects/claude-mux", "abc-123").unwrap();
+        assert!(path.ends_with("projects/-Users-elijah-mooring-Projects-claude-mux/abc-123.jsonl"));
+        assert!(transcript_path("/tmp", "../x").is_none());
+        assert!(transcript_path("/tmp", "").is_none());
     }
 }

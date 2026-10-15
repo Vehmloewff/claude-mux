@@ -18,6 +18,8 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Processor, Rgb, StdSyncHandler};
+use serde::Serialize;
+use unicode_width::UnicodeWidthStr;
 
 use crate::protocol::{self, CellStyle, Color, KeyCode, KeyInput, Screen, Span};
 
@@ -725,6 +727,174 @@ pub fn detect_background(screen: &str) -> bool {
 
 pub const TRUST_PROMPT: &str = "Folder trust prompt";
 
+/// One choice in a Claude Code dialog. `label` keeps the number (`1. Yes`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DialogOption {
+    pub label: String,
+    pub selected: bool,
+}
+
+/// The question and choices currently on screen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Dialog {
+    pub question: String,
+    pub options: Vec<DialogOption>,
+}
+
+/// Read the question and choices out of a dialog on screen.
+///
+/// Returns nothing unless the screen has dialog chrome (`Esc to…` or
+/// `Enter to confirm`) and a choice list, so a numbered list in claude's
+/// reply is left alone. Numbered rows (`1. Yes`) are the permission-prompt
+/// shape. The folder trust dialog has no numbers: the `❯` row and the rows
+/// indented to the same column are the choices. The marked row is
+/// `selected`. That marker moves when the selection changes and the question
+/// text does not, so this has to be read from the live screen.
+pub fn parse_dialog(screen: &str) -> Option<Dialog> {
+    let raw: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<String> = raw.iter().copied().map(clean_dialog_line).filter(|l| !l.is_empty()).collect();
+    if !lines.iter().any(|l| is_dialog_hint(l)) {
+        return None;
+    }
+    numbered_dialog(&lines).or_else(|| plain_dialog(&raw))
+}
+
+fn numbered_dialog(lines: &[String]) -> Option<Dialog> {
+    let parsed: Vec<Option<(bool, String)>> = lines.iter().map(|l| parse_option(l)).collect();
+    let end = parsed.iter().rposition(|p| p.is_some())?;
+    // A wrapped choice ("2. Yes, and always allow" / the path on the next
+    // line / "3. No") is still one list. Stop at the question or the hint.
+    let mut start = end;
+    while start > 0 {
+        let prev = &lines[start - 1];
+        if parsed[start - 1].is_some() {
+            start -= 1;
+            continue;
+        }
+        if is_dialog_hint(prev) || prev.contains('?') || !parsed[..start - 1].iter().any(|p| p.is_some()) {
+            break;
+        }
+        start -= 1;
+    }
+    let first = start + parsed[start..=end].iter().position(|p| p.is_some())?;
+    let options = parsed[start..=end]
+        .iter()
+        .filter_map(|p| p.clone())
+        .map(|(selected, label)| DialogOption { label, selected })
+        .collect();
+    Some(Dialog { question: question_above(lines, first), options })
+}
+
+/// Trust-style choices: `❯ No, exit` plus siblings indented to the label column.
+fn plain_dialog(raw: &[&str]) -> Option<Dialog> {
+    let marked = raw.iter().position(|line| plain_marker(line).is_some())?;
+    let (label_col, _) = plain_marker(raw[marked])?;
+    let mut start = marked;
+    while start > 0 && is_plain_choice(raw[start - 1], label_col) {
+        start -= 1;
+    }
+    let mut end = marked;
+    while end + 1 < raw.len() && is_plain_choice(raw[end + 1], label_col) {
+        end += 1;
+    }
+    let options: Vec<DialogOption> = raw[start..=end]
+        .iter()
+        .map(|line| match plain_marker(line) {
+            Some((_, label)) => DialogOption { label, selected: true },
+            None => DialogOption { label: line.trim().to_string(), selected: false },
+        })
+        .collect();
+    if options.len() < 2 {
+        return None;
+    }
+    let above: Vec<String> = raw[..start].iter().copied().map(clean_dialog_line).filter(|l| !l.is_empty()).collect();
+    Some(Dialog { question: question_above(&above, above.len()), options })
+}
+
+/// `(display column where the label starts, label)`.
+///
+/// The marker is one cell wide even though `❯` is three bytes, and the other
+/// choices are indented to that label column.
+fn plain_marker(line: &str) -> Option<(usize, String)> {
+    let line = line.trim_end();
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let marker = chars.next()?;
+    if !matches!(marker, '❯' | '›' | '>' | '→') {
+        return None;
+    }
+    let rest = chars.as_str().trim_start();
+    let label = rest.trim_end();
+    if label.is_empty() || label.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let prefix = line.len() - label.len();
+    Some((UnicodeWidthStr::width(&line[..prefix]), label.to_string()))
+}
+
+fn is_plain_choice(line: &str, label_col: usize) -> bool {
+    if plain_marker(line).is_some() {
+        return true;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() || is_dialog_hint(trimmed) || trimmed.starts_with('/') || trimmed.len() > 80 {
+        return false;
+    }
+    let lead = line.len() - line.trim_start().len();
+    UnicodeWidthStr::width(&line[..lead]) == label_col
+}
+
+/// The question is the `?` line closest above the choices. Wrapping means the
+/// `?` is not always the last character. Dialogs are short, so a `?` further
+/// up the transcript is not part of this one.
+fn question_above(lines: &[String], first_option: usize) -> String {
+    let above = &lines[first_option.saturating_sub(12)..first_option];
+    above
+        .iter()
+        .rev()
+        .find(|l| l.contains('?') && !is_dialog_hint(l))
+        .or_else(|| above.iter().rev().find(|l| !is_dialog_hint(l)))
+        .cloned()
+        .unwrap_or_else(|| "Waiting for a choice".into())
+}
+
+fn is_dialog_hint(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("esc to") || line.contains("enter to confirm") || line.contains("enter to select")
+}
+
+/// Drop the border characters Claude draws around a dialog.
+fn clean_dialog_line(line: &str) -> String {
+    line.trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '│' | '┃' | '║' | '|' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘' | '├'
+                    | '┤' | '┬' | '┴' | '┼' | '─' | '━' | '═' | ' '
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+/// `❯ 1. Yes` or `2. No`. The marker is optional; a space must follow the dot.
+fn parse_option(line: &str) -> Option<(bool, String)> {
+    let (selected, rest) = match line.chars().next() {
+        Some(c @ ('❯' | '›' | '>' | '→')) => (true, line[c.len_utf8()..].trim_start()),
+        _ => (false, line),
+    };
+    if !rest.chars().next()?.is_ascii_digit() {
+        return None;
+    }
+    let digits_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let body = rest[digits_end..].strip_prefix('.')?.strip_prefix(|c: char| c.is_whitespace())?;
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some((selected, format!("{}. {body}", &rest[..digits_end])))
+}
+
 /// Recognise Claude Code dialogs that block until a human answers.
 pub fn detect_prompt(screen: &str) -> Option<String> {
     let lines: Vec<&str> = screen.lines().collect();
@@ -900,5 +1070,107 @@ mod tests {
         assert_eq!(detect_prompt("just some output"), None);
         let perm = "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
         assert_eq!(detect_prompt(perm).as_deref(), Some("Do you want to proceed?"));
+    }
+
+    fn labels(dialog: &Dialog) -> Vec<(&str, bool)> {
+        dialog.options.iter().map(|o| (o.label.as_str(), o.selected)).collect()
+    }
+
+    #[test]
+    fn parses_question_and_options() {
+        let perm = "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+        let dialog = parse_dialog(perm).unwrap();
+        assert_eq!(dialog.question, "Do you want to proceed?");
+        assert_eq!(labels(&dialog), vec![("1. Yes", true), ("2. No", false)]);
+
+        let trust = "Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit\nEnter to confirm · Esc to exit";
+        let dialog = parse_dialog(trust).unwrap();
+        assert_eq!(dialog.question, "Do you trust the files in this folder?");
+        assert_eq!(labels(&dialog), vec![("1. Yes, proceed", true), ("2. No, exit", false)]);
+
+        let moved = "Do you want to make this edit?\n  1. Yes\n❯ 2. Yes, allow all edits this session\n  3. No\nEsc to cancel";
+        let dialog = parse_dialog(moved).unwrap();
+        assert_eq!(
+            labels(&dialog),
+            vec![("1. Yes", false), ("2. Yes, allow all edits this session", true), ("3. No", false)]
+        );
+
+        let ascii = "Do you want to proceed?\n> 1. Yes\n  2. No\nEnter to confirm";
+        assert_eq!(labels(&parse_dialog(ascii).unwrap()), vec![("1. Yes", true), ("2. No", false)]);
+    }
+
+    #[test]
+    fn parses_bordered_dialog_ignoring_earlier_list() {
+        let screen = "\
+1. Yes, that landed
+╭──────────────────────────────────────╮
+│ Bash command                         │
+│   rm -rf build                       │
+│ Do you want to proceed?              │
+│ ❯ 1. Yes                             │
+│   2. Yes, and don't ask again        │
+│   3. No                              │
+╰──────────────────────────────────────╯
+  Esc to cancel";
+        let dialog = parse_dialog(screen).unwrap();
+        assert_eq!(dialog.question, "Do you want to proceed?");
+        assert_eq!(
+            labels(&dialog),
+            vec![("1. Yes", true), ("2. Yes, and don't ask again", false), ("3. No", false)]
+        );
+        assert_eq!(parse_dialog("1. Yes\n2. No\nAll done."), None);
+        assert_eq!(parse_dialog("just some output"), None);
+    }
+
+    #[test]
+    fn parses_wrapped_permission_option() {
+        let screen = concat!(
+            " Do you want to proceed?\n",
+            " \u{276f} 1. Yes\n",
+            "   2. Yes, and always allow access to\n",
+            "      /tmp/project from this project\n",
+            "   3. No\n",
+            " Esc to cancel \u{00b7} Tab to amend",
+        );
+        let dialog = parse_dialog(screen).unwrap();
+        assert_eq!(dialog.question, "Do you want to proceed?");
+        assert_eq!(
+            labels(&dialog),
+            vec![
+                ("1. Yes", true),
+                ("2. Yes, and always allow access to", false),
+                ("3. No", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_unnumbered_trust_dialog() {
+        // Leading spaces are the real dialog: the unmarked choice is indented
+        // to the label column, one cell past the selection marker.
+        let screen = concat!(
+            " Accessing workspace:\n",
+            " /tmp/project\n",
+            " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n",
+            " project, or work from your team). If not, take a moment to review what's in this folder first.\n",
+            " Claude Code'll be able to read, edit, and execute files here.\n",
+            " Security guide\n",
+            " \u{276f} No, exit\n",
+            "   Yes, I trust this folder\n",
+            " Enter to confirm · Esc to cancel",
+        );
+        let dialog = parse_dialog(screen).unwrap();
+        assert!(dialog.question.contains('?'));
+        assert!(dialog.question.to_ascii_lowercase().contains("trust"));
+        assert_eq!(labels(&dialog), vec![("No, exit", true), ("Yes, I trust this folder", false)]);
+
+        let moved = concat!(
+            " Quick safety check: Is this a project you created or one you trust? (Like your own code)\n",
+            "   No, exit\n",
+            " \u{276f} Yes, I trust this folder\n",
+            " Enter to confirm · Esc to cancel",
+        );
+        let dialog = parse_dialog(moved).unwrap();
+        assert_eq!(labels(&dialog), vec![("No, exit", false), ("Yes, I trust this folder", true)]);
     }
 }
