@@ -56,6 +56,8 @@ SESSION STATES
 WAIT EXIT CODES (wait, create --wait, send --wait)
   0 idle   2 needs input   3 exited/stopped   124 timeout
   4 background tasks still running (only with `wait --turn`)
+  Invalid arguments exit with 64 rather than 2, so they can't pass for
+  needs input.
 
 WHEN A SESSION NEEDS INPUT
   `claude-mux questions` lists every question a session is blocked on.
@@ -303,7 +305,14 @@ enum QuestionsCmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            // Usage errors get their own code, apart from `wait`'s 2 (needs input).
+            return if e.use_stderr() { ExitCode::from(64) } else { ExitCode::SUCCESS };
+        }
+    };
     match run(cli.command) {
         Ok(code) => code,
         Err(e) => {
