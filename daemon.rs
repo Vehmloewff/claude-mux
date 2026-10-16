@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -177,6 +178,11 @@ pub enum Started {
 
 pub fn run() -> Result<Started> {
     std::fs::create_dir_all(paths::home())?;
+    std::fs::set_permissions(
+        paths::home(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .context("restrict daemon state directory permissions")?;
     // Exactly one daemon per state directory, even when several commands
     // start one at the same moment. The lock is held until the process exits
     // (the file is close-on-exec, so sessions don't inherit it).
@@ -195,6 +201,8 @@ pub fn run() -> Result<Started> {
     let sessions = load_sessions(&db)?;
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict socket permissions on {}", sock.display()))?;
     eprintln!("[{}] claude-mux daemon listening on {}", paths::now(), sock.display());
 
     let daemon: Shared = Arc::new(Daemon {
