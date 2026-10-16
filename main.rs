@@ -694,7 +694,10 @@ fn confirm(question: &str) -> Result<bool> {
 }
 
 fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool, quiet: bool, json: bool) -> Result<ExitCode> {
-    let req = Request::Wait { ids, any, timeout_ms: timeout.map(|s| s * 1000), turn };
+    let timeout_ms = timeout
+        .map(|seconds| seconds.checked_mul(1000).ok_or_else(|| anyhow::anyhow!("timeout is too large")))
+        .transpose()?;
+    let req = Request::Wait { ids, any, timeout_ms, turn };
     let Response::Wait { sessions, timed_out } = client::request(&req)? else { bail!("unexpected response") };
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);

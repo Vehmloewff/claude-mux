@@ -462,7 +462,13 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
 }
 
 fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, turn: bool) -> Result<Response> {
-    let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    let deadline = timeout_ms
+        .map(|ms| {
+            Instant::now()
+                .checked_add(Duration::from_millis(ms))
+                .ok_or_else(|| anyhow!("timeout is too large"))
+        })
+        .transpose()?;
     let mut inner = d.lock();
     if ids.is_empty() {
         bail!("no session ids given");
