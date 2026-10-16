@@ -23,10 +23,10 @@ command line.
   can resume them later.
 
 ```sh
-id=$(claude-mux create "Fix the login redirect bug" -d "Login bug")   # prints the session's id
-claude-mux send "$id" "Also add a regression test"                    # queued until claude is idle
-claude-mux wait "$id"                                                 # blocks, then prints the reply
-claude-mux manage                                                     # open the TUI
+claude-mux create "Fix the login redirect bug" -d "Login bug"   # prints the session's id
+claude-mux send -s 3f9a "Also add a regression test"            # any unique prefix of the id works
+claude-mux wait                                                 # no -s: pick sessions from a list
+claude-mux manage                                               # open the TUI
 ```
 
 ## Install
@@ -50,18 +50,21 @@ time a command needs it.
 | Command | |
 |---|---|
 | `create [PROMPT]` | Start a session and print its id. |
-| `send [ID] MESSAGE` | Send a message. It's queued until the session is idle. |
-| `wait ID…` | Block until the sessions finish, then print the final reply. |
+| `send MESSAGE` | Send a message. It's queued until the session is idle. |
+| `wait` | Block until the sessions finish, then print the final reply. |
 | `manage` | Open the TUI. |
 | `list` · `status` · `peek` · `last` | Inspect sessions. |
 | `questions` | List and answer questions a session is waiting on. |
-| `keys ID KEY…` | Press keys in a session, such as `down enter`. |
+| `keys KEY…` | Press keys in a session, such as `down enter`. |
 | `kill` · `resume` · `rm` · `describe` | Manage sessions. |
 | `shutdown` · `upgrade` | Stop or update the daemon. |
 
-A session's id is the id of its Claude Code conversation. Each session is
-labelled by its description (`create -d`, or `describe` later), falling back
-to its first prompt.
+A session's id is the id of its Claude Code conversation. Commands pick a
+session with `-s`/`--session`, which takes the id or any unique prefix of it;
+`list` shows the first 8 characters. Without `-s`, a command uses the only
+session it applies to. When several match, claude-mux asks which one you
+mean, and scripts with no terminal get an error listing them instead. Each session is labelled by its description
+(`create -d`, or `describe` later), falling back to its first prompt.
 
 Since a session is one conversation, `/clear` starts a new session: the
 running claude moves to a new id, and the old session is marked `cleared`

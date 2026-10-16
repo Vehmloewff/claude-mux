@@ -92,13 +92,13 @@ class Mux:
         return json.loads(cp.stdout or "[]")
 
     def status(self, sid: str) -> dict:
-        return json.loads(self.run("status", sid, "--json").stdout)
+        return json.loads(self.run("status", "-s", sid, "--json").stdout)
 
     def peek(self, sid: str) -> str:
-        return self.run("peek", sid, check=False).stdout
+        return self.run("peek", "-s", sid, check=False).stdout
 
     def rm(self, sid: str) -> None:
-        self.run("rm", sid, check=False)
+        self.run("rm", "-s", sid, check=False)
 
     def workdir(self, name: str) -> Path:
         path = self.work / name
@@ -128,7 +128,7 @@ class Mux:
         return self.run(*cmd).stdout.strip()
 
     def send(self, sid: str, message: str) -> None:
-        self.run("send", sid, message)
+        self.run("send", "-s", sid, message)
 
     def dump(self, name: str, sid: str | None, error: BaseException) -> None:
         dest = self.artifacts / name
@@ -293,7 +293,7 @@ def wait_for_dialog(mux: Mux, sid: str, match, timeout: float = DIALOG_TIMEOUT) 
     got = poll(mux, sid, pred, timeout, "dialog")
     if got is False:
         raise CaseFailure(
-            f"session went idle without the expected dialog\n{mux.peek(sid)}\n{mux.run('last', sid, check=False).stdout}"
+            f"session went idle without the expected dialog\n{mux.peek(sid)}\n{mux.run('last', '-s', sid, check=False).stdout}"
         )
     if isinstance(got, tuple):
         raise CaseFailure(f"dialog did not match\n{json.dumps(got[1], indent=2)}\n{mux.peek(sid)}")
@@ -312,7 +312,7 @@ def ensure_dialog(mux: Mux, sid: str, prompt: str, match) -> dict:
 
 
 def wait_settled(mux: Mux, sid: str, timeout: float = SETTLE_TIMEOUT) -> dict:
-    cp = mux.run("wait", sid, "--timeout", str(int(timeout)), "--json", check=False, timeout=timeout + 30)
+    cp = mux.run("wait", "-s", sid, "--timeout", str(int(timeout)), "--json", check=False, timeout=timeout + 30)
     if cp.returncode == 124:
         raise CaseFailure(f"wait timed out\n{mux.peek(sid)}")
     if cp.returncode != 0:
@@ -388,7 +388,7 @@ def test_trust_yes(mux: Mux) -> None:
         raise CaseFailure(f"Yes is already highlighted, so this would not move the selection: {question}")
     log(name, "submitting Yes, which is not the highlighted row")
     submitted = mux.run("questions", "submit").stdout
-    if f"submitted {sid}" not in submitted:
+    if f"submitted {sid[:8]}" not in submitted:
         raise CaseFailure(submitted)
 
     def cleared(status, rows):
@@ -605,7 +605,7 @@ def test_chat(mux: Mux) -> None:
         raise CaseFailure("chat needs exactly one waiting dialog")
     log(name, "choosing Chat about this")
     out = mux.run("questions", "chat", f"mention {CHAT}").stdout
-    if f"{sid}  chat" not in out:
+    if f"{sid[:8]}  chat" not in out:
         raise CaseFailure(out)
     info = wait_settled(mux, sid)
     text = transcript(info)
