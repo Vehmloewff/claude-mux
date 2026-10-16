@@ -21,7 +21,7 @@ fail() {
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || fail "not on main"
 command -v gh >/dev/null || fail "gh is required"
 command -v zig >/dev/null || fail "zig is required for the Linux builds"
-command -v cargo-zigbuild >/dev/null || fail "cargo-zigbuild is required (cargo install cargo-zigbuild)"
+cargo zigbuild --help >/dev/null 2>&1 || fail "cargo-zigbuild is required (cargo install cargo-zigbuild)"
 gh auth status >/dev/null 2>&1 || fail "gh is not logged in (gh auth login)"
 
 current="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
