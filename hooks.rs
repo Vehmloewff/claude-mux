@@ -49,11 +49,11 @@ pub fn settings_json() -> String {
 /// Entry point for `claude-mux hook <event>`. Never fails loudly: a broken
 /// daemon must not break the claude session.
 pub fn run_hook(event: &str) {
-    let Ok(id) = std::env::var("CLAUDE_MUX_SESSION_ID") else { return };
+    let Ok(process) = std::env::var("CLAUDE_MUX_PROCESS") else { return };
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
-    let req = Request::Hook { id, event: event.to_string(), payload };
+    let req = Request::Hook { process, event: event.to_string(), payload };
     let Ok(stream) = UnixStream::connect(paths::socket()) else { return };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));

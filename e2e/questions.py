@@ -115,7 +115,7 @@ class Mux:
         yolo: bool,
         claude_args: tuple[str, ...] = (),
     ) -> str:
-        cmd = ["create", "-C", str(cwd), "--name", name, "--model", MODEL]
+        cmd = ["create", "-C", str(cwd), "--description", name, "--model", MODEL]
         if prompt is not None:
             cmd.insert(1, prompt)
         if trust:
@@ -167,7 +167,7 @@ def encode_cwd(cwd: str) -> str:
 
 
 def transcript(info: dict) -> str:
-    path = claude_config() / "projects" / encode_cwd(info["cwd"]) / f"{info['claude_session_id']}.jsonl"
+    path = claude_config() / "projects" / encode_cwd(info["cwd"]) / f"{info['id']}.jsonl"
     if not path.exists():
         return ""
     return path.read_text(errors="replace")
@@ -700,13 +700,13 @@ def main(argv: list[str]) -> int:
                 sid = None
                 try:
                     rows = mux.questions()
-                    sid = next((r["id"] for r in rows if r.get("name") == name or (r.get("session") or {}).get("name") == name), None)
+                    sid = next((r["id"] for r in rows if r.get("description") == name or (r.get("session") or {}).get("description") == name), None)
                 except Exception:
                     sid = None
                 if sid is None:
                     listing = mux.run("list", "--json", check=False).stdout
                     try:
-                        sid = next((s["id"] for s in json.loads(listing or "[]") if s.get("name") == name), None)
+                        sid = next((s["id"] for s in json.loads(listing or "[]") if s.get("description") == name), None)
                     except json.JSONDecodeError:
                         sid = None
                 mux.dump(name, sid, e)

@@ -44,6 +44,7 @@ const STRIP_ENV: &[&str] = &[
     "CLAUDE_CODE_SSE_PORT",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_MUX_SESSION_ID",
+    "CLAUDE_MUX_PROCESS",
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
     "TMUX",
@@ -58,6 +59,10 @@ struct Proc {
 struct Session {
     info: SessionInfo,
     proc: Option<Proc>,
+    /// Token for the claude process last started for this session. Its
+    /// hooks, terminal events and exit find the session by it, so they
+    /// follow the process when a `/clear` moves it to a new session.
+    process: Option<String>,
     /// Kept after exit so the final screen can still be viewed.
     term: Option<TermHandle>,
     size: (u16, u16),
@@ -70,7 +75,7 @@ struct Session {
     screen_prompt: Option<String>,
     /// Status to return to when an on-screen dialog goes away.
     status_before_prompt: Option<Status>,
-    /// Whether the initial context is still to be submitted.
+    /// Whether the first prompt is still to be submitted.
     initial_pending: bool,
     /// When claude last reported any hook event.
     last_hook: Option<Instant>,
@@ -103,6 +108,7 @@ impl Session {
             resumable: info.turns > 0,
             info,
             proc: None,
+            process: None,
             term: None,
             size: (DEFAULT_COLS, DEFAULT_ROWS),
             queue: VecDeque::new(),
@@ -266,21 +272,6 @@ fn set_status(s: &mut Session, status: Status, detail: Option<String>) {
     }
 }
 
-fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-}
-
-fn new_id(inner: &Inner) -> String {
-    loop {
-        let id: String = uuid::Uuid::new_v4().simple().to_string()[..6].to_string();
-        if !inner.sessions.contains_key(&id) && id.chars().any(|c| c.is_ascii_alphabetic()) {
-            return id;
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Connections
 
@@ -318,6 +309,22 @@ fn session_mut<'a>(inner: &'a mut Inner, id: &str) -> Result<&'a mut Session> {
     inner.sessions.get_mut(id).ok_or_else(|| anyhow!("no session with id '{id}'"))
 }
 
+/// The session running the claude process `process`.
+fn session_of<'a>(inner: &'a mut Inner, process: &str) -> Option<&'a mut Session> {
+    inner.sessions.values_mut().find(|s| s.process.as_deref() == Some(process))
+}
+
+/// Why a session can't take input, pointing at the session that took over
+/// its process if it was cleared.
+fn not_running(info: &SessionInfo) -> anyhow::Error {
+    match &info.continued_as {
+        Some(next) if !info.status.is_live() => {
+            anyhow!("session {} was cleared; it continues as {}", info.short_id(), short_id(next))
+        }
+        _ => anyhow!("session {} is {}; resume it first", info.short_id(), info.status.label()),
+    }
+}
+
 fn handle_request(d: &Shared, req: Request) -> Result<Response> {
     match req {
         Request::Ping => Ok(Response::Pong { version: env!("CARGO_PKG_VERSION").into() }),
@@ -329,7 +336,7 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             let mut inner = d.lock();
             let s = session_mut(&mut inner, &id)?;
             if !s.info.status.is_live() {
-                bail!("session '{id}' is {}; resume it first", s.info.status.label());
+                return Err(not_running(&s.info));
             }
             if s.info.asleep || s.falling_asleep {
                 // Typed once claude is back at its prompt.
@@ -361,9 +368,9 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
         Request::Peek { id, ansi } => {
             let term = {
                 let mut inner = d.lock();
-                session_mut(&mut inner, &id)?.term.clone()
+                let s = session_mut(&mut inner, &id)?;
+                s.term.clone().ok_or_else(|| not_running(&s.info))?
             };
-            let term = term.ok_or_else(|| anyhow!("session '{id}' has no screen (not running)"))?;
             let text = term.text(false, ansi).ok_or_else(|| anyhow!("terminal did not respond"))?;
             Ok(Response::Text { text })
         }
@@ -396,10 +403,10 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             let info = resume(d, &id)?;
             Ok(Response::Session { session: info })
         }
-        Request::Rename { id, name } => {
+        Request::Describe { id, description } => {
             let mut inner = d.lock();
             let s = session_mut(&mut inner, &id)?;
-            s.info.name = name.filter(|n| !n.trim().is_empty());
+            s.info.description = description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
             let info = s.info.clone();
             d.touch(&mut inner);
             Ok(Response::Session { session: info })
@@ -416,11 +423,13 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
                     d.touch(&mut inner);
                     return Ok(Response::Ok);
                 }
+                if !s.info.status.is_live() {
+                    return Err(not_running(&s.info));
+                }
                 s.idle_since = None;
                 s.draft_at = Some(Instant::now());
-                s.term.clone()
+                s.term.clone().ok_or_else(|| not_running(&s.info))?
             };
-            let term = term.ok_or_else(|| anyhow!("session '{id}' is not running"))?;
             for key in keys {
                 term.key(key);
                 std::thread::sleep(Duration::from_millis(30));
@@ -430,8 +439,8 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             std::thread::sleep(Duration::from_millis(600));
             Ok(Response::Ok)
         }
-        Request::Hook { id, event, payload } => {
-            on_hook(d, &id, &event, payload);
+        Request::Hook { process, event, payload } => {
+            on_hook(d, &process, &event, payload);
             Ok(Response::Ok)
         }
         Request::Shutdown | Request::Subscribe => unreachable!(),
@@ -477,28 +486,17 @@ fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
         bail!("working directory '{}' does not exist", c.cwd);
     }
     let mut inner = d.lock();
-    let id = match c.id {
-        Some(id) => {
-            if !valid_id(&id) {
-                bail!("invalid id '{id}' (use letters, digits, '-', '_' or '.')");
-            }
-            if inner.sessions.contains_key(&id) {
-                bail!("a session with id '{id}' already exists");
-            }
-            id
-        }
-        None => new_id(&inner),
-    };
+    // Claude is started with this id for its conversation.
+    let id = uuid::Uuid::new_v4().to_string();
     let now = paths::now();
     let info = SessionInfo {
         id: id.clone(),
-        name: c.name,
+        description: c.description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
         cwd: c.cwd,
-        context: c.context.clone(),
+        prompt: c.prompt.clone(),
         status: Status::Starting,
         status_detail: None,
         title: None,
-        claude_session_id: uuid::Uuid::new_v4().to_string(),
         created_at: now,
         updated_at: now,
         exit_code: None,
@@ -509,9 +507,10 @@ fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
         auto_trust: c.trust,
         background: Vec::new(),
         asleep: false,
+        continued_as: None,
     };
     let mut session = Session::new(info);
-    session.initial_pending = !c.context.trim().is_empty();
+    session.initial_pending = !c.prompt.trim().is_empty();
     if session.initial_pending {
         // Claude can take a while to boot, especially on first run.
         session.awaiting_submit = Some((Instant::now(), Duration::from_secs(90)));
@@ -533,12 +532,14 @@ fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
         return Ok(info);
     }
     if s.info.status.is_live() {
-        bail!("session '{id}' is still running");
+        bail!("session {} is still running", short_id(id));
     }
     s.initial_pending = false;
     s.awaiting_submit = None;
     s.screen_prompt = None;
     s.info.exit_code = None;
+    // Back in its own conversation, no longer superseded.
+    s.info.continued_as = None;
     set_status(s, Status::Starting, Some("resuming".into()));
     spawn_claude(d, s, true)?;
     let info = s.info.clone();
@@ -576,18 +577,18 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
 
     let mut cmd = CommandBuilder::new(claude_bin());
     if resume {
-        cmd.args(["--resume", &s.info.claude_session_id]);
+        cmd.args(["--resume", &s.info.id]);
     } else {
-        cmd.args(["--session-id", &s.info.claude_session_id]);
+        cmd.args(["--session-id", &s.info.id]);
     }
     cmd.args(["--settings", &hooks::settings_json()]);
-    if let Some(name) = &s.info.name {
-        cmd.args(["--name", name]);
+    if let Some(description) = &s.info.description {
+        cmd.args(["--name", description]);
     }
     cmd.args(&s.info.claude_args);
-    if !resume && !s.info.context.trim().is_empty() {
+    if !resume && !s.info.prompt.trim().is_empty() {
         cmd.arg("--");
-        cmd.arg(&s.info.context);
+        cmd.arg(&s.info.prompt);
     }
     cmd.cwd(&s.info.cwd);
     for key in STRIP_ENV {
@@ -596,7 +597,9 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "claude-mux");
+    let process = uuid::Uuid::new_v4().to_string();
     cmd.env("CLAUDE_MUX_SESSION_ID", &s.info.id);
+    cmd.env("CLAUDE_MUX_PROCESS", &process);
     cmd.env("CLAUDE_MUX_HOME", paths::home());
     cmd.env("CLAUDE_MUX_SOCKET", paths::socket());
     // Make `claude-mux` itself available so sessions can orchestrate others.
@@ -615,11 +618,10 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     let mut reader = pty.master.try_clone_reader()?;
     let writer: PtyWriter = Arc::new(Mutex::new(pty.master.take_writer()?));
 
-    let id = s.info.id.clone();
     let term = {
         let d = d.clone();
-        let id = id.clone();
-        TermHandle::spawn(cols, rows, writer, move |ev| on_term_event(&d, &id, ev))
+        let process = process.clone();
+        TermHandle::spawn(cols, rows, writer, move |ev| on_term_event(&d, &process, ev))
     };
 
     // PTY output -> terminal emulator.
@@ -639,11 +641,12 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     // Process exit.
     {
         let d = d.clone();
-        let id = id.clone();
+        let process = process.clone();
         std::thread::spawn(move || {
             let code = child.wait().map(|s| s.exit_code() as i32).ok();
             let mut inner = d.lock();
-            if let Some(s) = inner.sessions.get_mut(&id) {
+            if let Some(s) = session_of(&mut inner, &process) {
+                let id = s.info.id.clone();
                 s.proc = None;
                 if std::mem::take(&mut s.falling_asleep) && !s.killed {
                     s.info.asleep = true;
@@ -679,6 +682,7 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     }
 
     s.proc = Some(Proc { master: pty.master, killer });
+    s.process = Some(process);
     s.term = Some(term);
     Ok(())
 }
@@ -835,9 +839,9 @@ fn resting_status(s: &Session) -> Status {
 // ---------------------------------------------------------------------------
 // Status tracking
 
-fn on_term_event(d: &Shared, id: &str, ev: TermEvent) {
+fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
     let mut inner = d.lock();
-    let Some(s) = inner.sessions.get_mut(id) else { return };
+    let Some(s) = session_of(&mut inner, process) else { return };
     match ev {
         TermEvent::Dirty => {
             s.screen_gen += 1;
@@ -903,26 +907,27 @@ fn accept_trust(term: &TermHandle) {
     term.key(KeyInput::plain(KeyCode::Enter));
 }
 
-fn on_hook(d: &Shared, id: &str, event: &str, payload: Value) {
+fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
     if std::env::var_os("CLAUDE_MUX_DEBUG").is_some() {
-        eprintln!("[{}] hook {id} {event} {payload}", paths::now());
+        eprintln!("[{}] hook {process} {event} {payload}", paths::now());
     }
     let last_message = (event == "Stop").then(|| hooks::last_assistant_message(&payload)).flatten();
     let mut inner = d.lock();
-    let Some(s) = inner.sessions.get_mut(id) else { return };
+    let Some(mut id) = session_of(&mut inner, process).map(|s| s.info.id.clone()) else { return };
+    if let Some(conversation) = payload.get("session_id").and_then(Value::as_str)
+        && !conversation.is_empty()
+        && conversation != id
+    {
+        let source = payload.get("source").and_then(Value::as_str).unwrap_or("");
+        if switch_conversation(&mut inner, &id, conversation, source) {
+            id = conversation.to_string();
+        }
+    }
+    let Some(s) = inner.sessions.get_mut(&id) else { return };
     if !s.info.status.is_live() {
         return;
     }
     s.last_hook = Some(Instant::now());
-    // Claude starts a new conversation on `/clear`; follow it so resuming
-    // continues the current one.
-    if let Some(sid) = payload.get("session_id").and_then(Value::as_str)
-        && !sid.is_empty()
-        && sid != s.info.claude_session_id
-    {
-        s.info.claude_session_id = sid.to_string();
-        s.resumable = false;
-    }
     match event {
         "SessionStart" => {
             let source = payload.get("source").and_then(Value::as_str).unwrap_or("");
@@ -983,6 +988,71 @@ fn on_hook(d: &Shared, id: &str, event: &str, payload: Value) {
         deliver_if_ready(s);
     }
     d.touch(&mut inner);
+}
+
+/// Claude moved the process of session `id` to another conversation: a new
+/// one (`/clear`), or one picked with `/resume`. The process, its screen
+/// and its queue go to that conversation's session, created if needed. The
+/// old session stops, pointing at the new one, and stays resumable; it is
+/// dropped instead if it never finished a turn, as there is nothing to
+/// resume. Returns false, changing nothing, if the conversation is already
+/// running in another process.
+fn switch_conversation(inner: &mut Inner, id: &str, conversation: &str, source: &str) -> bool {
+    if inner.sessions.get(conversation).is_some_and(|s| s.proc.is_some()) {
+        return false;
+    }
+    let Some(mut s) = inner.sessions.remove(id) else { return false };
+    let now = paths::now();
+    let mut info = match inner.sessions.remove(conversation) {
+        Some(known) => known.info,
+        None => SessionInfo {
+            id: conversation.to_string(),
+            prompt: String::new(),
+            title: None,
+            created_at: now,
+            turns: 0,
+            last_message: None,
+            background: Vec::new(),
+            ..s.info.clone()
+        },
+    };
+    info.cwd = s.info.cwd.clone();
+    info.claude_args = s.info.claude_args.clone();
+    info.auto_trust = s.info.auto_trust;
+    info.status = s.info.status;
+    info.status_detail = s.info.status_detail.clone();
+    info.queued = s.info.queued;
+    info.exit_code = None;
+    info.asleep = false;
+    info.continued_as = None;
+    info.updated_at = now;
+
+    let keep_old = s.info.turns > 0 || s.resumable;
+    let mut old = Session::new(s.info.clone());
+    old.info.queued = 0;
+    old.info.background.clear();
+    old.info.continued_as = Some(conversation.to_string());
+    let detail = match source {
+        "clear" => format!("cleared; continues as {}", short_id(conversation)),
+        _ => format!("switched to {}", short_id(conversation)),
+    };
+    set_status(&mut old, Status::Stopped, Some(detail));
+
+    s.resumable = info.turns > 0;
+    s.initial_pending = false;
+    s.info = info;
+    inner.sessions.insert(conversation.to_string(), s);
+    if keep_old {
+        inner.sessions.insert(id.to_string(), old);
+    } else {
+        // Sessions cleared into the dropped one now lead past it.
+        for other in inner.sessions.values_mut() {
+            if other.info.continued_as.as_deref() == Some(id) {
+                other.info.continued_as = Some(conversation.to_string());
+            }
+        }
+    }
+    true
 }
 
 /// Type the keys and pastes that woke the session.
@@ -1054,6 +1124,95 @@ mod tests {
         assert_eq!(background_detail(&tasks).as_deref(), Some("2 shells running: Run tests (+1)"));
         assert!(running_background_tasks(&serde_json::json!({ "background_tasks": [] })).is_empty());
         assert!(running_background_tasks(&serde_json::json!({})).is_empty());
+    }
+
+    fn session(id: &str, turns: u64) -> Session {
+        let mut s = Session::new(SessionInfo {
+            id: id.into(),
+            description: Some("Login bug".into()),
+            cwd: "/tmp".into(),
+            prompt: "Fix the login redirect".into(),
+            status: Status::Idle,
+            status_detail: None,
+            title: Some("Fixing login".into()),
+            created_at: 1,
+            updated_at: 1,
+            exit_code: None,
+            queued: 0,
+            turns,
+            last_message: (turns > 0).then(|| "Done".into()),
+            claude_args: vec!["--model".into(), "opus".into()],
+            auto_trust: true,
+            background: Vec::new(),
+            asleep: false,
+            continued_as: None,
+        });
+        s.process = Some(format!("proc-{id}"));
+        s
+    }
+
+    fn inner(sessions: Vec<Session>) -> Inner {
+        Inner { sessions: sessions.into_iter().map(|s| (s.info.id.clone(), s)).collect(), version: 0 }
+    }
+
+    #[test]
+    fn clear_moves_the_process_to_a_new_session() {
+        let mut a = session("a", 2);
+        a.queue.push_back("next".into());
+        a.info.queued = 1;
+        let mut inner = inner(vec![a]);
+        assert!(switch_conversation(&mut inner, "a", "b", "clear"));
+
+        let old = &inner.sessions["a"];
+        assert_eq!(old.info.status, Status::Stopped);
+        assert_eq!(old.info.continued_as.as_deref(), Some("b"));
+        assert_eq!(old.info.status_label(), "cleared");
+        assert_eq!(old.info.last_message.as_deref(), Some("Done"));
+        assert_eq!(old.process, None);
+        assert_eq!(old.info.queued, 0);
+
+        let new = &inner.sessions["b"];
+        assert_eq!(new.process.as_deref(), Some("proc-a"));
+        assert_eq!(new.info.description.as_deref(), Some("Login bug"));
+        assert_eq!(new.info.prompt, "");
+        assert_eq!(new.info.turns, 0);
+        assert_eq!(new.info.last_message, None);
+        assert_eq!(new.info.claude_args, ["--model", "opus"]);
+        assert_eq!(new.queue, ["next"]);
+        assert_eq!(new.info.queued, 1);
+        assert!(!new.resumable);
+    }
+
+    #[test]
+    fn clearing_an_unused_session_drops_it() {
+        let mut first = session("first", 3);
+        first.process = None;
+        first.info.status = Status::Stopped;
+        first.info.continued_as = Some("a".into());
+        let mut inner = inner(vec![first, session("a", 0)]);
+        assert!(switch_conversation(&mut inner, "a", "b", "clear"));
+        assert!(!inner.sessions.contains_key("a"));
+        assert_eq!(inner.sessions["first"].info.continued_as.as_deref(), Some("b"));
+        assert_eq!(inner.sessions["b"].process.as_deref(), Some("proc-a"));
+    }
+
+    #[test]
+    fn resuming_a_known_conversation_reuses_its_session() {
+        let mut known = session("k", 5);
+        known.process = None;
+        known.info.status = Status::Stopped;
+        known.info.prompt = "Original task".into();
+        known.info.continued_as = Some("x".into());
+        let mut inner = inner(vec![session("a", 1), known]);
+        assert!(switch_conversation(&mut inner, "a", "k", "resume"));
+        let k = &inner.sessions["k"];
+        assert_eq!(k.process.as_deref(), Some("proc-a"));
+        assert_eq!(k.info.prompt, "Original task");
+        assert_eq!(k.info.turns, 5);
+        assert_eq!(k.info.status, Status::Idle);
+        assert_eq!(k.info.continued_as, None);
+        assert!(k.resumable);
+        assert_eq!(inner.sessions["a"].info.status_detail.as_deref(), Some("switched to k"));
     }
 }
 

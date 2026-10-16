@@ -120,7 +120,7 @@ impl TextInput {
 enum Modal {
     New { fields: [TextInput; 3], field: usize },
     Send { id: String, input: TextInput },
-    Rename { id: String, input: TextInput },
+    Describe { id: String, input: TextInput },
     Confirm { prompt: String, action: Confirmed },
     Help,
 }
@@ -130,7 +130,7 @@ enum Confirmed {
     Remove(String),
 }
 
-const NEW_FIELDS: [&str; 3] = ["Context / task", "Directory", "Name (optional)"];
+const NEW_FIELDS: [&str; 3] = ["Prompt", "Directory", "Description (optional)"];
 
 struct App {
     sessions: Vec<SessionInfo>,
@@ -251,7 +251,18 @@ impl App {
         match msg {
             AppMsg::Stream(StreamEvent::Sessions { mut sessions }) => {
                 sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+                // Follow the claude process when a `/clear` moves it to a new session.
+                let was_running = self.selected_session().is_some_and(|s| s.status.is_live());
+                let successor = self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| sessions.iter().find(|s| &s.id == id))
+                    .and_then(|s| s.continued_as.clone())
+                    .filter(|next| was_running && sessions.iter().any(|s| &s.id == next));
                 self.sessions = sessions;
+                if successor.is_some() {
+                    self.selected = successor;
+                }
                 let still_there = self.selected.as_ref().is_some_and(|id| self.sessions.iter().any(|s| &s.id == id));
                 if !still_there {
                     self.selected = self.sessions.last().map(|s| s.id.clone());
@@ -321,7 +332,7 @@ impl App {
             let msg = match client::request(&req) {
                 Ok(Response::Session { session }) if select_created => {
                     let _ = tx.send(AppMsg::Select(session.id.clone()));
-                    AppMsg::Flash(format!("{ok_text} {}", session.id), false)
+                    AppMsg::Flash(format!("{ok_text} {}", session.short_id()), false)
                 }
                 Ok(_) => AppMsg::Flash(ok_text, false),
                 Err(e) => AppMsg::Flash(format!("{e:#}"), true),
@@ -348,7 +359,7 @@ impl App {
                 if let Some(modal) = self.modal.as_mut() {
                     let input = match modal {
                         Modal::New { fields, field } => Some(&mut fields[*field]),
-                        Modal::Send { input, .. } | Modal::Rename { input, .. } => Some(input),
+                        Modal::Send { input, .. } | Modal::Describe { input, .. } => Some(input),
                         _ => None,
                     };
                     if let Some(input) = input {
@@ -488,7 +499,7 @@ impl App {
             }
             CtKey::Char('x') if s.status.is_live() => {
                 self.modal = Some(Modal::Confirm {
-                    prompt: format!("Kill session {}? It can be resumed later.", s.id),
+                    prompt: format!("Kill session {}? It can be resumed later.", s.short_id()),
                     action: Confirmed::Kill(s.id.clone()),
                 });
             }
@@ -496,19 +507,19 @@ impl App {
                 if s.status.is_live() && !s.asleep {
                     self.flash("session is already running", true);
                 } else {
-                    self.command(Request::Resume { id: s.id.clone() }, format!("resumed {}", s.id), false);
+                    self.command(Request::Resume { id: s.id.clone() }, format!("resumed {}", s.short_id()), false);
                 }
             }
             CtKey::Char('d') | CtKey::Delete => {
                 let warn = if s.status.is_live() { " This kills the running claude." } else { "" };
                 self.modal = Some(Modal::Confirm {
-                    prompt: format!("Remove session {}?{warn}", s.id),
+                    prompt: format!("Remove session {}?{warn}", s.short_id()),
                     action: Confirmed::Remove(s.id.clone()),
                 });
             }
             CtKey::Char('R') => {
-                let current = s.name.clone().unwrap_or_default();
-                self.modal = Some(Modal::Rename { id: s.id.clone(), input: TextInput::new(&current) });
+                let current = s.description.clone().unwrap_or_default();
+                self.modal = Some(Modal::Describe { id: s.id.clone(), input: TextInput::new(&current) });
             }
             _ => {}
         }
@@ -536,7 +547,7 @@ impl App {
             Modal::Send { id, input } => match key.code {
                 CtKey::Enter if !input.text.trim().is_empty() => {
                     let req = Request::Send { id: id.clone(), message: input.text.clone(), now: false };
-                    self.command(req, format!("sent to {id}"), false);
+                    self.command(req, format!("sent to {}", short_id(id)), false);
                     false
                 }
                 _ => {
@@ -544,10 +555,10 @@ impl App {
                     true
                 }
             },
-            Modal::Rename { id, input } => match key.code {
+            Modal::Describe { id, input } => match key.code {
                 CtKey::Enter => {
-                    let req = Request::Rename { id: id.clone(), name: Some(input.text.trim().to_string()) };
-                    self.command(req, format!("renamed {id}"), false);
+                    let req = Request::Describe { id: id.clone(), description: Some(input.text.trim().to_string()) };
+                    self.command(req, "description saved", false);
                     false
                 }
                 _ => {
@@ -570,12 +581,11 @@ impl App {
                         Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
                         None => cwd.to_string(),
                     };
-                    let name = fields[2].text.trim();
+                    let description = fields[2].text.trim();
                     let req = Request::Create(CreateRequest {
-                        id: None,
-                        name: (!name.is_empty()).then(|| name.to_string()),
+                        description: (!description.is_empty()).then(|| description.to_string()),
                         cwd,
-                        context: fields[0].text.trim().to_string(),
+                        prompt: fields[0].text.trim().to_string(),
                         claude_args: Vec::new(),
                         trust: false,
                     });
@@ -677,7 +687,7 @@ impl App {
 
             let status = s.effective_status();
             let (icon, icon_style) = self.status_icon(status, s.asleep);
-            let label = status.label();
+            let label = s.status_label();
             let num = if i < 9 { format!("{}", i + 1) } else { " ".into() };
             let name_w = width.saturating_sub(label.len() + 6);
             let name = fit(s.display_name(), name_w);
@@ -702,9 +712,9 @@ impl App {
                 (Some(d), Status::NeedsInput | Status::Background | Status::Exited | Status::Stopped) => d.clone(),
                 _ => {
                     let queued = if s.queued > 0 { format!(" · {} queued", s.queued) } else { String::new() };
-                    let fixed = format!("{} ·  · {}{}", s.id, ago(s.updated_at), queued);
+                    let fixed = format!("{} ·  · {}{}", s.short_id(), ago(s.updated_at), queued);
                     let room = width.saturating_sub(4 + display_width(&fixed));
-                    format!("{} · {} · {}{}", s.id, fit_left(&short_path(&s.cwd), room), ago(s.updated_at), queued)
+                    format!("{} · {} · {}{}", s.short_id(), fit_left(&short_path(&s.cwd), room), ago(s.updated_at), queued)
                 }
             };
             let line2 = Line::from(TSpan::styled(
@@ -727,7 +737,7 @@ impl App {
                 TSpan::styled(icon, icon_style),
                 TSpan::raw(" "),
                 TSpan::raw(s.display_name().to_string()).bold(),
-                TSpan::raw(format!(" · {} ", s.id)).fg(TColor::DarkGray),
+                TSpan::raw(format!(" · {} ", s.short_id())).fg(TColor::DarkGray),
             ];
             if let Some((_, screen)) = &self.screen
                 && screen.scrolled {
@@ -759,8 +769,12 @@ impl App {
                         }
             }
             _ => {
-                let text = match s.status {
-                    Status::Stopped | Status::Exited => format!(
+                let text = match (s.status, &s.continued_as) {
+                    (Status::Stopped, Some(next)) => format!(
+                        "Session was cleared; claude continues as {}.\n\nPress r to resume this conversation, or d to remove it.",
+                        short_id(next)
+                    ),
+                    (Status::Stopped | Status::Exited, _) => format!(
                         "Session is {}.\n\nPress r to resume it, or d to remove it.",
                         s.status.label()
                     ),
@@ -823,7 +837,7 @@ impl App {
         let (title, h) = match modal {
             Modal::New { .. } => (" New session ", 16),
             Modal::Send { .. } => (" Send message ", 9),
-            Modal::Rename { .. } => (" Rename session ", 6),
+            Modal::Describe { .. } => (" Describe session ", 6),
             Modal::Confirm { .. } => (" Confirm ", 5),
             Modal::Help => (" Keys ", 22),
         };
@@ -859,7 +873,7 @@ impl App {
             }
             Modal::Send { id, input } => {
                 f.render_widget(
-                    Paragraph::new(format!("To {id} (delivered when claude is idle)")).fg(TColor::Gray),
+                    Paragraph::new(format!("To {} (delivered when claude is idle)", short_id(id))).fg(TColor::Gray),
                     Rect::new(inner.x, inner.y, inner.width, 1),
                 );
                 draw_input(f, Rect::new(inner.x, inner.y + 1, inner.width, 4), input, true);
@@ -868,7 +882,7 @@ impl App {
                     Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), inner.width, 1),
                 );
             }
-            Modal::Rename { input, .. } => {
+            Modal::Describe { input, .. } => {
                 draw_input(f, Rect::new(inner.x, inner.y + 1, inner.width, 1), input, true);
                 f.render_widget(
                     Paragraph::new(hint("enter save (empty clears) · esc cancel")),
@@ -894,7 +908,7 @@ impl App {
                     ("x", "kill session (resumable)"),
                     ("r", "resume a stopped/exited session"),
                     ("d", "remove session"),
-                    ("R", "rename session"),
+                    ("R", "describe session"),
                     ("pgup / pgdn", "scroll the terminal"),
                     ("mouse wheel", "scroll · click to select/focus"),
                     ("esc", "back to live output"),

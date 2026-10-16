@@ -33,9 +33,9 @@ fn migrations() -> Vec<(&'static str, &'static str)> {
     migrations
 }
 
-const SESSION_COLUMNS: &str = "id, name, cwd, context, status, status_detail, title, \
-    claude_session_id, created_at, updated_at, exit_code, turns, last_message, \
-    claude_args, auto_trust, background, asleep";
+const SESSION_COLUMNS: &str = "id, description, cwd, prompt, status, status_detail, title, \
+    created_at, updated_at, exit_code, turns, last_message, \
+    claude_args, auto_trust, background, asleep, continued_as";
 
 /// The async Turso API driven synchronously: local file IO completes inline,
 /// so there is no reactor to run.
@@ -167,13 +167,12 @@ fn status_name(status: Status) -> Result<Value> {
 fn session_params(info: &SessionInfo) -> Result<Vec<Value>> {
     Ok(vec![
         text(&info.id),
-        opt_text(&info.name),
+        opt_text(&info.description),
         text(&info.cwd),
-        text(&info.context),
+        text(&info.prompt),
         status_name(info.status)?,
         opt_text(&info.status_detail),
         opt_text(&info.title),
-        text(&info.claude_session_id),
         Value::Integer(info.created_at as i64),
         Value::Integer(info.updated_at as i64),
         info.exit_code.map_or(Value::Null, |c| Value::Integer(c.into())),
@@ -183,6 +182,7 @@ fn session_params(info: &SessionInfo) -> Result<Vec<Value>> {
         Value::Integer(info.auto_trust.into()),
         Value::Text(serde_json::to_string(&info.background)?),
         Value::Integer(info.asleep.into()),
+        opt_text(&info.continued_as),
     ])
 }
 
@@ -190,24 +190,24 @@ fn session_from_row(row: &turso::Row) -> Result<SessionInfo> {
     let status: String = row.get(4)?;
     Ok(SessionInfo {
         id: row.get(0)?,
-        name: row.get(1)?,
+        description: row.get(1)?,
         cwd: row.get(2)?,
-        context: row.get(3)?,
+        prompt: row.get(3)?,
         status: serde_json::from_value(serde_json::Value::String(status.clone()))
             .map_err(|_| anyhow!("unknown status '{status}'"))?,
         status_detail: row.get(5)?,
         title: row.get(6)?,
-        claude_session_id: row.get(7)?,
-        created_at: row.get::<i64>(8)? as u64,
-        updated_at: row.get::<i64>(9)? as u64,
-        exit_code: row.get::<Option<i64>>(10)?.map(|c| c as i32),
+        created_at: row.get::<i64>(7)? as u64,
+        updated_at: row.get::<i64>(8)? as u64,
+        exit_code: row.get::<Option<i64>>(9)?.map(|c| c as i32),
         queued: 0,
-        turns: row.get::<i64>(11)? as u64,
-        last_message: row.get(12)?,
-        claude_args: serde_json::from_str(&row.get::<String>(13)?)?,
-        auto_trust: row.get::<i64>(14)? != 0,
-        background: serde_json::from_str(&row.get::<String>(15)?)?,
-        asleep: row.get::<i64>(16)? != 0,
+        turns: row.get::<i64>(10)? as u64,
+        last_message: row.get(11)?,
+        claude_args: serde_json::from_str(&row.get::<String>(12)?)?,
+        auto_trust: row.get::<i64>(13)? != 0,
+        background: serde_json::from_str(&row.get::<String>(14)?)?,
+        asleep: row.get::<i64>(15)? != 0,
+        continued_as: row.get(16)?,
     })
 }
 
@@ -226,13 +226,12 @@ mod tests {
     fn sample(id: &str) -> SessionInfo {
         SessionInfo {
             id: id.into(),
-            name: Some("demo".into()),
+            description: Some("demo".into()),
             cwd: "/tmp".into(),
-            context: "do the thing".into(),
+            prompt: "do the thing".into(),
             status: Status::NeedsInput,
             status_detail: None,
             title: Some("title".into()),
-            claude_session_id: "abc".into(),
             created_at: 10,
             updated_at: 20,
             exit_code: Some(-1),
@@ -243,6 +242,7 @@ mod tests {
             auto_trust: true,
             background: vec![BackgroundTask { id: "b1".into(), kind: "shell".into(), description: "npm test".into() }],
             asleep: true,
+            continued_as: Some("c3".into()),
         }
     }
 
@@ -266,6 +266,7 @@ mod tests {
         assert_eq!(s.claude_args, ["--model", "opus"]);
         assert!(s.auto_trust);
         assert!(s.asleep);
+        assert_eq!(s.continued_as.as_deref(), Some("c3"));
         assert_eq!(s.background[0].description, "npm test");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

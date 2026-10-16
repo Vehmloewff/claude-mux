@@ -29,12 +29,12 @@ struct Cli {
 
 const AFTER_HELP: &str = "\
 TYPICAL WORKFLOW
-  id=$(claude-mux create \"Fix the flaky test in tests/auth_test.go\" --name flaky-test -C ~/repo)
+  id=$(claude-mux create \"Fix the flaky test in tests/auth_test.go\" -d \"Flaky auth test\" -C ~/repo)
   claude-mux wait \"$id\"                       # blocks until the turn ends, prints claude's reply
   claude-mux send \"$id\" \"Also add a regression test\" --wait
-  claude-mux wait a b c --any                  # first of several sessions to finish
+  claude-mux wait \"$a\" \"$b\" --any            # first of several sessions to finish
 
-  The context passed to `create` is the session's first prompt. The session
+  The prompt passed to `create` is the session's first message. The session
   shares none of the caller's context, so write it like a ticket: the goal,
   where to look, and how to tell when it's done.
 
@@ -50,6 +50,8 @@ SESSION STATES
                `send` or `keys` (CLAUDE_MUX_SLEEP_AFTER=<secs>|never)
   exited       the claude process ended on its own
   stopped      killed or the daemon restarted; `claude-mux resume` continues it
+  cleared      `/clear` moved claude on to a new session (see below); JSON
+               shows it as stopped with `continued_as` set
 
 WAIT EXIT CODES (wait, create --wait, send --wait)
   0 idle   2 needs input   3 exited/stopped   124 timeout
@@ -71,7 +73,21 @@ WHEN A SESSION NEEDS INPUT
 NOTES
   Sessions keep running when the caller exits; `claude-mux kill` stops one
   (resumable) and `claude-mux rm` deletes it. Inside a managed session `claude-mux`
-  is on PATH and CLAUDE_MUX_SESSION_ID holds the session's own id.
+  is on PATH and CLAUDE_MUX_SESSION_ID holds the id the session started with.
+
+/CLEAR STARTS A NEW SESSION
+  A session is one Claude Code conversation, and its id is claude's own id
+  for it. `/clear` starts a new conversation, so the running claude moves
+  to a new session with a new id. The old session is left `cleared`: it
+  keeps its last reply and can still be resumed, but commands that need it
+  running fail and name its successor:
+
+    claude-mux: session 3f9a1c2e was cleared; it continues as 9b21e0c4
+
+  `wait` on the old id returns exit code 3. To give a script a fresh start,
+  `create` a new session instead of sending `/clear`. Picking another
+  conversation with `/resume` moves claude to that conversation's session
+  the same way. CLAUDE_MUX_SESSION_ID keeps the id the process started with.
 
 ENVIRONMENT
   CLAUDE_MUX_HOME        holds state.db, daemon.log, daemon.sock (default ~/.claude-mux)
@@ -82,17 +98,15 @@ ENVIRONMENT
 enum Command {
     /// Start a new Claude Code session; prints its id.
     ///
-    /// CONTEXT becomes claude's first prompt. The command returns as soon as the
+    /// PROMPT is claude's first message. The command returns as soon as the
     /// session starts (unless --wait); use `claude-mux wait <id>` for the result.
     Create {
-        /// Context / task for the session. Use '-' to read from stdin.
-        context: Option<String>,
-        /// Session id to use (default: a random short id).
-        #[arg(long)]
-        id: Option<String>,
-        /// Display name shown in `manage`.
+        /// The first message for claude. Use '-' to read from stdin.
+        prompt: Option<String>,
+        /// What the session is for, shown by `list` and `manage` (default: the
+        /// prompt's first line).
         #[arg(long, short)]
-        name: Option<String>,
+        description: Option<String>,
         /// Working directory for claude (default: current directory).
         #[arg(long, short = 'C')]
         cwd: Option<String>,
@@ -121,7 +135,9 @@ enum Command {
     /// Send a message to a session (queued until claude is idle).
     ///
     /// Each queued message is typed in once the previous turn finishes, so it
-    /// runs as its own turn. Slash commands (e.g. "/compact") work too.
+    /// runs as its own turn. Slash commands (e.g. "/compact") work too, but
+    /// "/clear" moves claude on to a new session with a new id: see
+    /// `claude-mux --help`.
     Send {
         /// `<message>` or `<id> <message>`. Use '-' as the message to read stdin.
         #[arg(required = true, num_args = 1..=2)]
@@ -173,7 +189,7 @@ enum Command {
     /// Interactive TUI to watch and drive every session.
     ///
     /// Session list: j/k move, 1-9 jump, enter focus terminal, n new, s send,
-    /// x kill, r resume, d delete, R rename, pgup/pgdn scroll, ? help, q quit.
+    /// x kill, r resume, d delete, R describe, pgup/pgdn scroll, ? help, q quit.
     /// Terminal focused: keys go to claude; ctrl-] returns to the list.
     Manage {
         /// Session to select on start.
@@ -230,8 +246,8 @@ enum Command {
     /// Remove a session (killing it if it is running).
     #[command(alias = "remove")]
     Rm { ids: Vec<String> },
-    /// Rename a session (empty name clears it).
-    Rename { id: String, name: String },
+    /// Set what a session is for, as shown by `list` and `manage` (empty clears it).
+    Describe { id: String, description: String },
     /// Stop the daemon and every running session.
     Shutdown,
     /// Run the daemon in the foreground (logs on stderr).
@@ -324,9 +340,8 @@ fn list_sessions() -> Result<Vec<SessionInfo>> {
 fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Create {
-            context,
-            id,
-            name,
+            prompt,
+            description,
             cwd,
             model,
             permission_mode,
@@ -336,7 +351,7 @@ fn run(command: Command) -> Result<ExitCode> {
             timeout,
             claude_args: extra,
         } => {
-            let context = context.map(read_arg).transpose()?.unwrap_or_default();
+            let prompt = prompt.map(read_arg).transpose()?.unwrap_or_default();
             let cwd = match cwd {
                 Some(dir) => std::fs::canonicalize(&dir).with_context(|| format!("no such directory: {dir}"))?,
                 None => std::env::current_dir()?,
@@ -353,10 +368,9 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             claude_args.extend(extra);
             let req = Request::Create(CreateRequest {
-                id,
-                name,
+                description,
                 cwd: cwd.to_string_lossy().into_owned(),
-                context,
+                prompt,
                 claude_args,
                 trust,
             });
@@ -455,8 +469,8 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Rename { id, name } => {
-            client::request(&Request::Rename { id, name: Some(name) })?;
+        Command::Describe { id, description } => {
+            client::request(&Request::Describe { id, description: Some(description) })?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Shutdown => {
@@ -601,12 +615,12 @@ fn order_waiting(sessions: &mut [SessionInfo]) {
 }
 
 fn print_table(sessions: &[SessionInfo]) {
-    println!("{:<14} {:<12} {:>5} {:<28} CWD", "ID", "STATUS", "AGE", "NAME");
+    println!("{:<36}  {:<12} {:>5}  {:<28} CWD", "ID", "STATUS", "AGE", "DESCRIPTION");
     for s in sessions {
         println!(
-            "{:<14} {:<12} {:>5} {:<28} {}",
+            "{:<36}  {:<12} {:>5}  {:<28} {}",
             s.id,
-            s.effective_status().label(),
+            s.status_label(),
             ago(s.created_at),
             truncate(s.display_name(), 28),
             short_path(&s.cwd)
@@ -1069,7 +1083,7 @@ fn waiting_rows(mut sessions: Vec<SessionInfo>) -> Vec<WaitingRow> {
         if session.status == Status::Exited {
             continue;
         }
-        let mut ask = hooks::pending_ask_for(&session.cwd, &session.claude_session_id);
+        let mut ask = hooks::pending_ask_for(&session.cwd, &session.id);
         let mut from_screen = false;
         if !counts_as_waiting(&session, ask.is_some()) {
             continue;
@@ -1084,14 +1098,14 @@ fn waiting_rows(mut sessions: Vec<SessionInfo>) -> Vec<WaitingRow> {
 }
 
 fn print_waiting(rows: &[WaitingRow]) {
-    println!("{:<14} {:>7} {:<28} CWD", "ID", "WAITING", "NAME");
+    println!("{:<36}  {:>7}  {:<28} CWD", "ID", "WAITING", "DESCRIPTION");
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
             println!();
         }
         let s = &row.session;
         println!(
-            "{:<14} {:>7} {:<28} {}",
+            "{:<36}  {:>7}  {:<28} {}",
             s.id,
             ago(s.updated_at),
             truncate(s.display_name(), 28),
@@ -1147,8 +1161,8 @@ fn print_waiting(rows: &[WaitingRow]) {
 
 fn print_details(s: &SessionInfo) {
     println!("id:        {}", s.id);
-    if let Some(n) = &s.name {
-        println!("name:      {n}");
+    if let Some(d) = &s.description {
+        println!("description: {d}");
     }
     if let Some(t) = &s.title {
         println!("title:     {t}");
@@ -1162,9 +1176,11 @@ fn print_details(s: &SessionInfo) {
     if s.queued > 0 {
         println!("queued:    {}", s.queued);
     }
-    println!("claude id: {}", s.claude_session_id);
-    if !s.context.is_empty() {
-        println!("context:   {}", truncate(&s.context, 100));
+    if let Some(next) = &s.continued_as {
+        println!("continued: as {next}");
+    }
+    if !s.prompt.is_empty() {
+        println!("prompt:    {}", truncate(&s.prompt, 100));
     }
     if let Some(m) = &s.last_message {
         println!("last reply:\n{m}");
@@ -1178,13 +1194,12 @@ mod tests {
     fn session(id: &str, status: Status, updated_at: u64) -> SessionInfo {
         SessionInfo {
             id: id.into(),
-            name: None,
+            description: None,
             cwd: "/tmp".into(),
-            context: String::new(),
+            prompt: String::new(),
             status,
             status_detail: None,
             title: None,
-            claude_session_id: "x".into(),
             created_at: 0,
             updated_at,
             exit_code: None,
@@ -1195,6 +1210,7 @@ mod tests {
             auto_trust: false,
             background: vec![],
             asleep: false,
+            continued_as: None,
         }
     }
 

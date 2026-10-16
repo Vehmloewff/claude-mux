@@ -60,18 +60,19 @@ impl Status {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
+    /// Claude Code's id for the conversation (`--session-id`/`--resume`).
+    /// A `/clear` starts a new conversation, and with it a new session.
     pub id: String,
-    pub name: Option<String>,
+    /// What the session is for, as given by the user.
+    pub description: Option<String>,
     pub cwd: String,
-    /// The initial context the session was created with.
-    pub context: String,
+    /// The first prompt the session was created with.
+    pub prompt: String,
     pub status: Status,
     /// Extra detail on the status, e.g. the permission prompt text.
     pub status_detail: Option<String>,
     /// Terminal title set by claude (usually a short task summary).
     pub title: Option<String>,
-    /// Claude Code's own session id (used for `--resume`).
-    pub claude_session_id: String,
     pub created_at: u64,
     pub updated_at: u64,
     pub exit_code: Option<i32>,
@@ -90,6 +91,10 @@ pub struct SessionInfo {
     /// resumes it when it is sent a message or keys.
     #[serde(default)]
     pub asleep: bool,
+    /// The session that took over this one's claude process when it started
+    /// a new conversation (`/clear`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_as: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,11 +106,30 @@ pub struct BackgroundTask {
 }
 
 impl SessionInfo {
+    /// The description, else the first line of the prompt, else claude's
+    /// terminal title, else the short id.
     pub fn display_name(&self) -> &str {
-        self.name
+        self.description
             .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .or_else(|| self.prompt.lines().map(str::trim).find(|l| !l.is_empty()))
             .or(self.title.as_deref())
-            .unwrap_or(&self.id)
+            .unwrap_or(self.short_id())
+    }
+
+    /// The first characters of the id: enough to tell sessions apart, and
+    /// accepted anywhere an id is.
+    pub fn short_id(&self) -> &str {
+        short_id(&self.id)
+    }
+
+    /// The status to show people: `cleared` for a session whose process
+    /// went on to a new conversation.
+    pub fn status_label(&self) -> &'static str {
+        match self.effective_status() {
+            Status::Stopped if self.continued_as.is_some() => "cleared",
+            status => status.label(),
+        }
     }
 
     /// The status `wait` reports: queued messages count as pending work.
@@ -118,12 +142,16 @@ impl SessionInfo {
     }
 }
 
+/// The first characters of a session id, as `list` shows it.
+pub fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateRequest {
-    pub id: Option<String>,
-    pub name: Option<String>,
+    pub description: Option<String>,
     pub cwd: String,
-    pub context: String,
+    pub prompt: String,
     pub claude_args: Vec<String>,
     /// Automatically accept the folder trust dialog.
     #[serde(default)]
@@ -168,17 +196,18 @@ pub enum Request {
     Resume {
         id: String,
     },
-    Rename {
+    Describe {
         id: String,
-        name: Option<String>,
+        description: Option<String>,
     },
     /// Press keys in a session (e.g. to answer a dialog).
     Keys {
         id: String,
         keys: Vec<KeyInput>,
     },
+    /// A Claude Code hook fired in the claude process `process`.
     Hook {
-        id: String,
+        process: String,
         event: String,
         payload: serde_json::Value,
     },

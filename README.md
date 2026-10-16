@@ -23,10 +23,10 @@ command line.
   can resume them later.
 
 ```sh
-claude-mux create "Fix the login redirect bug" --name login-bug   # prints an id, e.g. 3f9a1c
-claude-mux send 3f9a1c "Also add a regression test"               # queued until claude is idle
-claude-mux wait 3f9a1c                                            # blocks, then prints the reply
-claude-mux manage                                                 # open the TUI
+id=$(claude-mux create "Fix the login redirect bug" -d "Login bug")   # prints the session's id
+claude-mux send "$id" "Also add a regression test"                    # queued until claude is idle
+claude-mux wait "$id"                                                 # blocks, then prints the reply
+claude-mux manage                                                     # open the TUI
 ```
 
 ## Install
@@ -56,8 +56,16 @@ time a command needs it.
 | `list` · `status` · `peek` · `last` | Inspect sessions. |
 | `questions` | List and answer questions a session is waiting on. |
 | `keys ID KEY…` | Press keys in a session, such as `down enter`. |
-| `kill` · `resume` · `rm` · `rename` | Manage sessions. |
+| `kill` · `resume` · `rm` · `describe` | Manage sessions. |
 | `shutdown` · `upgrade` | Stop or update the daemon. |
+
+A session's id is the id of its Claude Code conversation. Each session is
+labelled by its description (`create -d`, or `describe` later), falling back
+to its first prompt.
+
+Since a session is one conversation, `/clear` starts a new session: the
+running claude moves to a new id, and the old session is marked `cleared`
+and points to its successor. It can still be resumed.
 
 Run `claude-mux --help` for every flag. It covers everything an agent needs
 to drive claude-mux.
