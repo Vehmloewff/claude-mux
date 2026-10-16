@@ -34,7 +34,13 @@ fn sleep_after() -> Option<Duration> {
     match std::env::var("CLAUDE_MUX_SLEEP_AFTER") {
         Err(_) => Some(DEFAULT_SLEEP_AFTER),
         Ok(v) if matches!(v.trim(), "never" | "off") => None,
-        Ok(v) => Some(v.trim().parse().map(Duration::from_secs_f64).unwrap_or(DEFAULT_SLEEP_AFTER)),
+        Ok(v) => Some(
+            v.trim()
+                .parse::<f64>()
+                .ok()
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+                .unwrap_or(DEFAULT_SLEEP_AFTER),
+        ),
     }
 }
 
