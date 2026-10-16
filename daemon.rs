@@ -165,7 +165,7 @@ type Shared = Arc<Daemon>;
 pub enum Started {
     /// Served until shutdown.
     Ran,
-    /// Another claude-muxd holds the lock; nothing to do.
+    /// Another daemon holds the lock; nothing to do.
     AlreadyRunning,
 }
 
@@ -320,7 +320,7 @@ fn session_mut<'a>(inner: &'a mut Inner, id: &str) -> Result<&'a mut Session> {
 
 fn handle_request(d: &Shared, req: Request) -> Result<Response> {
     match req {
-        Request::Ping => Ok(Response::Ok),
+        Request::Ping => Ok(Response::Pong { version: env!("CARGO_PKG_VERSION").into() }),
         Request::Create(c) => {
             let info = create(d, c)?;
             Ok(Response::Session { session: info })

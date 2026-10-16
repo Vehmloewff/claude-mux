@@ -31,7 +31,7 @@ fn shell_quote(s: &str) -> String {
 
 /// The `--settings` JSON passed to every managed claude.
 pub fn settings_json() -> String {
-    let exe = paths::sibling_exe("claude-mux").to_string_lossy().into_owned();
+    let exe = paths::exe().to_string_lossy().into_owned();
     let mut hooks = serde_json::Map::new();
     for event in EVENTS {
         hooks.insert(

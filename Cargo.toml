@@ -11,10 +11,6 @@ path = "lib.rs"
 name = "claude-mux"
 path = "main.rs"
 
-[[bin]]
-name = "claude-muxd"
-path = "claude-muxd.rs"
-
 [dependencies]
 alacritty_terminal = "0.26"
 anyhow = "1.0.104"

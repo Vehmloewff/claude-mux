@@ -193,6 +193,8 @@ pub enum Request {
 pub enum Response {
     Ok,
     Error { message: String },
+    /// Answer to `Ping`: the daemon's claude-mux version.
+    Pong { version: String },
     Session { session: SessionInfo },
     Sessions { sessions: Vec<SessionInfo> },
     Text { text: String },

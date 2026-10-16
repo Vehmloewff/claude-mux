@@ -47,10 +47,32 @@ fn try_connect() -> Option<Conn> {
     Some(Conn { reader: BufReader::new(stream), writer })
 }
 
-/// Connect to the daemon, starting `claude-muxd` first if it isn't running.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Version of the running daemon, or None if no daemon is running.
+pub fn daemon_version() -> Option<String> {
+    let mut conn = try_connect()?;
+    conn.send(&Request::Ping).ok()?;
+    match conn.recv::<Response>() {
+        Ok(Some(Response::Pong { version })) => Some(version),
+        _ => Some("unknown".into()),
+    }
+}
+
+/// Connect to the daemon, starting `claude-mux daemon` first if it isn't running.
+/// Refuses a daemon from a different claude-mux version: the CLI and the
+/// daemon always run the same build.
 pub fn connect() -> Result<Conn> {
-    if let Some(conn) = try_connect() {
-        return Ok(conn);
+    if let Some(version) = daemon_version() {
+        if version != VERSION {
+            bail!(
+                "the running daemon is claude-mux {version}, but this is {VERSION}. Run `claude-mux shutdown` \
+                 to stop it (running sessions stop and can be resumed); the next command starts a matching daemon"
+            );
+        }
+        if let Some(conn) = try_connect() {
+            return Ok(conn);
+        }
     }
     spawn_daemon()?;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -61,7 +83,7 @@ pub fn connect() -> Result<Conn> {
         std::thread::sleep(Duration::from_millis(25));
     }
     bail!(
-        "started claude-muxd but it isn't answering at {} (see {})",
+        "started the daemon but it isn't answering at {} (see {})",
         paths::socket().display(),
         paths::log_file().display()
     )
@@ -72,26 +94,42 @@ pub fn connect_existing() -> Option<Conn> {
     try_connect()
 }
 
-/// Start claude-muxd fully detached: double-forked so it is re-parented to
+/// Stop the daemon (whatever its version) and wait for it to finish stopping
+/// sessions. Returns false if no daemon was running.
+pub fn shutdown() -> Result<bool> {
+    let Some(mut conn) = try_connect() else { return Ok(false) };
+    conn.send(&Request::Shutdown)?;
+    let _ = conn.recv::<Response>();
+    for _ in 0..100 {
+        if try_connect().is_none() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(true)
+}
+
+/// Start `claude-mux daemon` fully detached: double-forked so it is re-parented to
 /// init/launchd rather than staying a child of this command, in its own
 /// session, with output appended to the daemon log. If several commands race
-/// to start it, claude-muxd's lock file lets only one of them run.
+/// to start it, the daemon's lock file lets only one of them run.
 fn spawn_daemon() -> Result<()> {
     std::fs::create_dir_all(paths::home())?;
-    let exe = paths::sibling_exe("claude-muxd");
+    let exe = paths::exe();
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(paths::log_file())
         .with_context(|| format!("open {}", paths::log_file().display()))?;
     let mut cmd = Command::new(&exe);
+    cmd.arg("daemon");
     cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
     unsafe {
         cmd.pre_exec(|| {
             // Only async-signal-safe calls here (we are between fork and exec).
             match libc::fork() {
                 -1 => return Err(std::io::Error::last_os_error()),
-                0 => {}                  // grandchild: becomes claude-muxd
+                0 => {}                  // grandchild: becomes the daemon
                 _ => libc::_exit(0),     // intermediate child: exit right away
             }
             libc::setsid();
@@ -100,8 +138,8 @@ fn spawn_daemon() -> Result<()> {
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to start {} (is claude-muxd installed?)", exe.display()))?;
-    // Reap the intermediate process; claude-muxd itself is no longer our child.
+        .with_context(|| format!("failed to start {} daemon", exe.display()))?;
+    // Reap the intermediate process; the daemon itself is no longer our child.
     let _ = child.wait();
     Ok(())
 }

@@ -15,26 +15,29 @@ claude-mux manage                                                             # 
 
 ## Install
 
-Requires Rust and Claude Code on `PATH`.
+Requires [Claude Code](https://claude.com/claude-code) on `PATH`. Prebuilt
+binaries are published for macOS and Linux (x86_64 and arm64).
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Vehmloewff/claude-mux/main/install.sh | sh
+```
+
+This installs `claude-mux` to `~/.local/bin`. Set
+`CLAUDE_MUX_INSTALL_DIR` to install somewhere else, or `CLAUDE_MUX_VERSION`
+(e.g. `v0.2.0`) to pick a release. Later, `claude-mux upgrade` replaces the
+binary with the latest release and restarts the daemon. If sessions are
+running, it lists them and asks first, since the restart stops them (they can
+be resumed). The CLI never talks to a daemon from a different version: if one
+is running, commands fail until you `claude-mux shutdown` it.
+
+To build from source instead (requires Rust):
 
 ```sh
 cargo install --path . --locked
 ```
 
 There's nothing else to set up: the first `claude-mux` command that needs the
-daemon starts `claude-muxd` in the background.
-
-### Nix
-
-The flake provides `packages.<system>.default` (both binaries), an overlay
-(`overlays.default`, adding `pkgs.claude-mux`) and a `devShells.default`.
-
-```sh
-nix run github:Vehmloewff/claude-mux -- list
-nix profile install github:Vehmloewff/claude-mux
-```
-
-No service module is needed, since `claude-muxd` starts on demand.
+daemon starts it in the background.
 
 Everything an agent needs to drive claude-mux is in `claude-mux --help`.
 
@@ -50,6 +53,8 @@ Everything an agent needs to drive claude-mux is in `claude-mux --help`.
 | `claude-mux keys ID KEY…` | Press keys, e.g. `claude-mux keys 3f9a1c down enter` to answer a dialog. |
 | `claude-mux kill ID` · `resume ID` · `rm ID…` · `rename ID NAME` | Manage the lifecycle. |
 | `claude-mux shutdown` | Stop the daemon and all sessions. |
+| `claude-mux upgrade [--version V] [--force] [--yes]` | Install the latest release (or V) over the current binary and restart the daemon. Asks first if sessions are running. |
+| `claude-mux daemon` | Run the daemon in the foreground. You never need to; commands start it on demand. |
 
 `wait` exits with `0` when the sessions are idle, `2` when one needs input
 (a permission or trust dialog), `3` when one exited or stopped, and `124` on
@@ -83,15 +88,15 @@ directory and age. The right pane shows the selected session's terminal.
 
 ## How it works
 
-- **Daemon.** `claude-muxd` is a separate binary that is never run as a
+- **Daemon.** The daemon is `claude-mux daemon`, and it's never run as a
   service. Any `claude-mux` command that needs it (everything except
-  `shutdown` and the internal hook) starts it if the socket doesn't answer.
+  `shutdown`, `upgrade`, `daemon` and the internal hook) starts it if the socket doesn't answer.
   It's double-forked into its own session, so it isn't a child of the
   command that started it, and its output goes to `~/.claude-mux/daemon.log`.
   A lock file (`~/.claude-mux/daemon.lock`) guarantees one daemon per state
   directory even when several commands start it at once. It stays up until
   `claude-mux shutdown` (or `SIGTERM`), which stops the sessions and records
-  them as `stopped` so they can be resumed. Run `claude-muxd` by hand to keep
+  them as `stopped` so they can be resumed. Run `claude-mux daemon` by hand to keep
   it in the foreground with logs on stderr. It listens
   on `~/.claude-mux/daemon.sock`. It owns every claude process and its PTY.
   Session records are kept in a Turso database at `~/.claude-mux/state.db`, so
@@ -127,5 +132,13 @@ directory and age. The right pane shows the selected session's terminal.
 
 Environment variables: `CLAUDE_MUX_HOME` sets the directory holding `state.db`, the log and the socket,
 `CLAUDE_MUX_SOCKET` sets the socket path, `CLAUDE_MUX_CLAUDE_BIN` sets the
-claude binary, `CLAUDE_MUX_SLEEP_AFTER` sets the idle seconds before a session sleeps (`never` turns sleeping off), and `CLAUDE_MUX_DEBUG=1` makes `claude-muxd` log every hook payload. Inside a session, `CLAUDE_MUX_SESSION_ID` is set and `claude-mux` is
+claude binary, `CLAUDE_MUX_SLEEP_AFTER` sets the idle seconds before a session sleeps (`never` turns sleeping off), and `CLAUDE_MUX_DEBUG=1` makes the daemon log every hook payload. Inside a session, `CLAUDE_MUX_SESSION_ID` is set and `claude-mux` is
 on `PATH`.
+
+## Releasing
+
+`./release.sh <version|patch|minor|major>` bumps the version in `Cargo.toml`,
+builds every target (Linux via `cargo zigbuild`, so it needs `zig` and
+`cargo-zigbuild`), commits and tags the bump, pushes, and creates a GitHub
+release with the `claude-mux-<target>.tar.gz` archives and `SHA256SUMS`
+attached. `install.sh` and `claude-mux upgrade` download those archives.

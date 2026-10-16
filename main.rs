@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use claude_mux::paths;
 use claude_mux::protocol::{self, CreateRequest, KeyInput, Request, Response, SessionInfo, Status};
 use claude_mux::term::{Dialog, parse_dialog};
-use claude_mux::{ago, client, hooks, manage, short_path};
+use claude_mux::{ago, client, hooks, manage, short_path, upgrade};
 
 #[derive(Parser)]
 #[command(
@@ -16,8 +16,8 @@ use claude_mux::{ago, client, hooks, manage, short_path};
     version,
     about = "Run and manage many Claude Code sessions from one place",
     long_about = "Run and manage many Claude Code sessions from one place.\n\n\
-Each session is an interactive `claude` running in the claude-muxd daemon, which \
-must already be running. People, scripts and other Claude sessions can create sessions, send \
+Each session is an interactive `claude` running in the claude-mux daemon, which \
+starts on demand. People, scripts and other Claude sessions can create sessions, send \
 them work and wait for results; `claude-mux manage` shows every session live.",
     after_help = "Run `claude-mux --help` for the workflow, session states, exit codes and environment.",
     after_long_help = AFTER_HELP
@@ -234,6 +234,32 @@ enum Command {
     Rename { id: String, name: String },
     /// Stop the daemon and every running session.
     Shutdown,
+    /// Run the daemon in the foreground (logs on stderr).
+    ///
+    /// The daemon owns every Claude Code session, its PTY and its terminal
+    /// emulator, and serves `claude-mux` over a Unix socket. Any command that
+    /// needs it starts it automatically, detached, so there is no need to run
+    /// it yourself or install it as a service. If a daemon is already running
+    /// for this state directory, it exits immediately. Stop it with
+    /// `claude-mux shutdown`.
+    Daemon,
+    /// Replace claude-mux with the latest GitHub release and restart the daemon.
+    ///
+    /// The daemon always runs the same version as the CLI, so upgrading
+    /// restarts it. Sessions with a running claude process are stopped (resume
+    /// them with `claude-mux resume`); asleep sessions wake as usual. If any
+    /// are running, upgrade lists them and asks first (or pass --yes).
+    Upgrade {
+        /// Release to install, e.g. `v0.2.0` (default: the latest).
+        #[arg(long)]
+        version: Option<String>,
+        /// Reinstall even if this version is already installed.
+        #[arg(long)]
+        force: bool,
+        /// Don't ask before restarting the daemon while sessions are running.
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Internal: Claude Code hook handler.
     #[command(hide = true)]
     Hook { event: String },
@@ -434,27 +460,88 @@ fn run(command: Command) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Shutdown => {
-            match client::connect_existing() {
-                Some(mut conn) => {
-                    conn.send(&Request::Shutdown)?;
-                    let _ = conn.recv::<Response>();
-                    // Wait for the daemon to finish stopping sessions.
-                    for _ in 0..100 {
-                        if client::connect_existing().is_none() {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                }
-                None => eprintln!("claude-mux: daemon is not running"),
+            if !client::shutdown()? {
+                eprintln!("claude-mux: daemon is not running");
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Daemon => {
+            if let claude_mux::daemon::Started::AlreadyRunning = claude_mux::daemon::run()? {
+                eprintln!("claude-mux: daemon already running for {}", paths::home().display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Upgrade { version, force, yes } => upgrade_cmd(version, force, yes),
         Command::Hook { event } => {
             hooks::run_hook(&event);
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn upgrade_cmd(version: Option<String>, force: bool, yes: bool) -> Result<ExitCode> {
+    let tag = upgrade::resolve_tag(version)?;
+    let current = format!("v{}", client::VERSION);
+    if tag == current && !force {
+        println!("claude-mux {current} is already up to date");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let daemon = client::daemon_version();
+    if let Some(daemon_version) = &daemon {
+        // Ask the daemon directly: it may be a different version, which `client::request` refuses.
+        let sessions = client::connect_existing().and_then(|mut conn| {
+            conn.send(&Request::List).ok()?;
+            match conn.recv::<Response>() {
+                Ok(Some(Response::Sessions { sessions })) => Some(sessions),
+                _ => None,
+            }
+        });
+        let running: Option<Vec<SessionInfo>> =
+            sessions.map(|s| s.into_iter().filter(|s| s.status.is_live() && !s.asleep).collect());
+        let ask = match &running {
+            Some(running) if running.is_empty() => false,
+            Some(running) => {
+                eprintln!("These sessions are running and will be stopped when the daemon restarts:\n");
+                print_table(running);
+                eprintln!("\nResume them afterwards with `claude-mux resume <id>`.");
+                true
+            }
+            None => {
+                eprintln!(
+                    "The daemon (claude-mux {daemon_version}) is running and will be restarted, \
+                     stopping any running sessions."
+                );
+                true
+            }
+        };
+        if ask && !yes && !confirm("Upgrade and restart the daemon?")? {
+            eprintln!("Not upgrading.");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+
+    let exe = upgrade::install(&tag)?;
+    println!("Upgraded claude-mux {current} → {tag} at {}", exe.display());
+    if daemon.is_some() {
+        client::shutdown()?;
+        drop(client::connect().context("starting the new daemon")?);
+        println!("Restarted the daemon");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Ask a yes/no question on the terminal; refuses when there is none to ask on.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        bail!("not a terminal, so can't ask; pass --yes to proceed");
+    }
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool, quiet: bool, json: bool) -> Result<ExitCode> {

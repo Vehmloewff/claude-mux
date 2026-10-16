@@ -1,6 +1,6 @@
 //! claude-mux: run and manage many Claude Code sessions.
 //!
-//! Shared by the `claude-mux` CLI and the `claude-muxd` daemon.
+//! Shared by the `claude-mux` CLI and its daemon (`claude-mux daemon`).
 
 pub mod client;
 pub mod daemon;
@@ -10,6 +10,7 @@ pub mod manage;
 pub mod paths;
 pub mod protocol;
 pub mod term;
+pub mod upgrade;
 
 pub fn ago(ts: u64) -> String {
     let secs = paths::now().saturating_sub(ts);

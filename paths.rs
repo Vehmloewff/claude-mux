@@ -41,9 +41,11 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Locate a sibling claude-mux executable (`claude-mux` / `claude-muxd`): next to the
-/// running binary if present, otherwise rely on PATH.
-pub fn sibling_exe(name: &str) -> PathBuf {
+/// Locate the `claude-mux` executable: next to the running binary if present,
+/// otherwise rely on PATH. Joining the name (rather than using `current_exe`
+/// as is) keeps this working after `claude-mux upgrade` replaced the file.
+pub fn exe() -> PathBuf {
+    let name = "claude-mux";
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
