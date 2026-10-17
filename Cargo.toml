@@ -22,6 +22,7 @@ libc = "0.2.190"
 pollster = "1.0.1"
 portable-pty = "0.9.0"
 ratatui = "0.30.2"
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 turso = { version = "0.8.3", default-features = false }

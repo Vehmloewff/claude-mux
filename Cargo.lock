@@ -543,6 +543,7 @@ dependencies = [
  "pollster",
  "portable-pty",
  "ratatui",
+ "semver",
  "serde",
  "serde_json",
  "turso",

@@ -428,6 +428,9 @@ fn main() -> ExitCode {
             return if e.use_stderr() { ExitCode::from(64) } else { ExitCode::SUCCESS };
         }
     };
+    if !matches!(&cli.command, Command::Hook { .. } | Command::Daemon | Command::Upgrade { .. }) {
+        upgrade::notify_if_update_available();
+    }
     match run(cli.command) {
         Ok(code) => code,
         Err(e) => {

@@ -39,11 +39,8 @@ curl -fsSL https://raw.githubusercontent.com/Vehmloewff/claude-mux/main/install.
 ```
 
 This installs the binary to `~/.local/bin`. Run `claude-mux upgrade` later to
-update it. You can also build from source with
-`cargo install --path . --locked`.
-
-You don't need to set anything up: the daemon starts on its own the first
-time a command needs it.
+update it. User-facing commands check GitHub for updates at most once every
+24 hours.
 
 ## Usage
 
