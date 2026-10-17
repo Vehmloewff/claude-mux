@@ -1,7 +1,7 @@
-use std::io::Read;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
@@ -419,7 +419,8 @@ enum QuestionsCmd {
     },
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -429,9 +430,9 @@ fn main() -> ExitCode {
         }
     };
     if !matches!(&cli.command, Command::Hook { .. } | Command::Daemon | Command::Upgrade { .. }) {
-        upgrade::notify_if_update_available();
+        upgrade::notify_if_update_available().await;
     }
-    match run(cli.command) {
+    match run(cli.command).await {
         Ok(code) => code,
         Err(e) => {
             eprintln!("claude-mux: {e:#}");
@@ -440,10 +441,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn read_arg(value: String) -> Result<String> {
+async fn read_arg(value: String) -> Result<String> {
     if value == "-" {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).context("reading stdin")?;
+        tokio::io::stdin().read_to_string(&mut buf).await.context("reading stdin")?;
         Ok(buf)
     } else {
         Ok(value)
@@ -451,25 +452,25 @@ fn read_arg(value: String) -> Result<String> {
 }
 
 /// The session `-s` names, or the one picked from those `offer` includes.
-fn pick(session: One, offer: Offer, prompt: &str) -> Result<String> {
-    select::one(&list_sessions()?, session.session.as_deref(), offer, prompt)
+async fn pick(session: One, offer: Offer, prompt: &str) -> Result<String> {
+    select::one(&list_sessions().await?, session.session.as_deref(), offer, prompt)
 }
 
-fn get_session(id: &str) -> Result<SessionInfo> {
-    match client::request(&Request::Get { id: id.into() })? {
+async fn get_session(id: &str) -> Result<SessionInfo> {
+    match client::request(&Request::Get { id: id.into() }).await? {
         Response::Session { session } => Ok(session),
         other => bail!("unexpected response: {other:?}"),
     }
 }
 
-fn list_sessions() -> Result<Vec<SessionInfo>> {
-    match client::request(&Request::List)? {
+async fn list_sessions() -> Result<Vec<SessionInfo>> {
+    match client::request(&Request::List).await? {
         Response::Sessions { sessions } => Ok(sessions),
         other => bail!("unexpected response: {other:?}"),
     }
 }
 
-fn run(command: Command) -> Result<ExitCode> {
+async fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Create {
             prompt,
@@ -483,7 +484,10 @@ fn run(command: Command) -> Result<ExitCode> {
             timeout,
             claude_args: extra,
         } => {
-            let prompt = prompt.map(read_arg).transpose()?.unwrap_or_default();
+            let prompt = match prompt {
+                Some(p) => read_arg(p).await?,
+                None => String::new(),
+            };
             let cwd = match cwd {
                 Some(dir) => std::fs::canonicalize(&dir).map_err(|_| anyhow::anyhow!("no such directory: {dir}"))?,
                 None => std::env::current_dir()?,
@@ -506,43 +510,43 @@ fn run(command: Command) -> Result<ExitCode> {
                 claude_args,
                 trust,
             });
-            let Response::Session { session } = client::request(&req)? else { bail!("unexpected response") };
+            let Response::Session { session } = client::request(&req).await? else { bail!("unexpected response") };
             if wait {
                 eprintln!("{}", session.id);
-                return wait_cmd(vec![session.id], false, timeout, false, false, false);
+                return wait_cmd(vec![session.id], false, timeout, false, false, false).await;
             }
             println!("{}", session.id);
             Ok(ExitCode::SUCCESS)
         }
         Command::Send { message, session, now, wait, timeout } => {
-            let message = read_arg(message)?;
+            let message = read_arg(message).await?;
             if message.trim().is_empty() {
                 bail!("message is empty");
             }
-            let id = pick(session, Offer::Running, "Send to which session?")?;
-            client::request(&Request::Send { id: id.clone(), message, now })?;
+            let id = pick(session, Offer::Running, "Send to which session?").await?;
+            client::request(&Request::Send { id: id.clone(), message, now }).await?;
             if wait {
-                return wait_cmd(vec![id], false, timeout, false, false, false);
+                return wait_cmd(vec![id], false, timeout, false, false, false).await;
             }
             Ok(ExitCode::SUCCESS)
         }
         Command::Wait { sessions, any, timeout, turn, quiet, json } => {
-            let ids = select::many(&list_sessions()?, &sessions.sessions, Offer::Running, "Wait for which sessions?")?;
-            wait_cmd(ids, any, timeout, turn, quiet, json)
+            let ids = select::many(&list_sessions().await?, &sessions.sessions, Offer::Running, "Wait for which sessions?")?;
+            wait_cmd(ids, any, timeout, turn, quiet, json).await
         }
         Command::Manage { session } => {
             let id = match session {
-                Some(q) => Some(select::one(&list_sessions()?, Some(&q), Offer::All, "Select which session?")?),
+                Some(q) => Some(select::one(&list_sessions().await?, Some(&q), Offer::All, "Select which session?")?),
                 None => None,
             };
-            manage::run(id, false).map(|_| ExitCode::SUCCESS)
+            manage::run(id, false).await.map(|_| ExitCode::SUCCESS)
         }
         Command::Attach { session } => {
-            let id = pick(session, Offer::Running, "Attach to which session?")?;
-            manage::run(Some(id), true).map(|_| ExitCode::SUCCESS)
+            let id = pick(session, Offer::Running, "Attach to which session?").await?;
+            manage::run(Some(id), true).await.map(|_| ExitCode::SUCCESS)
         }
         Command::List { json } => {
-            let sessions = list_sessions()?;
+            let sessions = list_sessions().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&sessions)?);
             } else if sessions.is_empty() {
@@ -552,10 +556,10 @@ fn run(command: Command) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Questions { cmd, session, json } => questions_cmd(cmd, session, json),
+        Command::Questions { cmd, session, json } => questions_cmd(cmd, session, json).await,
         Command::Status { session, json } => {
-            let id = pick(session, Offer::All, "Show which session?")?;
-            let s = get_session(&id)?;
+            let id = pick(session, Offer::All, "Show which session?").await?;
+            let s = get_session(&id).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&s)?);
             } else {
@@ -564,8 +568,8 @@ fn run(command: Command) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Peek { session, ansi } => {
-            let id = pick(session, Offer::Running, "Peek at which session?")?;
-            let Response::Text { text } = client::request(&Request::Peek { id, ansi })? else {
+            let id = pick(session, Offer::Running, "Peek at which session?").await?;
+            let Response::Text { text } = client::request(&Request::Peek { id, ansi }).await? else {
                 bail!("unexpected response")
             };
             print!("{text}");
@@ -576,13 +580,13 @@ fn run(command: Command) -> Result<ExitCode> {
                 .iter()
                 .map(|k| protocol::KeyInput::parse(k).with_context(|| format!("unknown key '{k}' (see `claude-mux keys --help`)")))
                 .collect::<Result<Vec<_>>>()?;
-            let id = pick(session, Offer::Running, "Press keys in which session?")?;
-            client::request(&Request::Keys { id, keys })?;
+            let id = pick(session, Offer::Running, "Press keys in which session?").await?;
+            client::request(&Request::Keys { id, keys }).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Last { session } => {
-            let id = pick(session, Offer::All, "Show the last reply of which session?")?;
-            let s = get_session(&id)?;
+            let id = pick(session, Offer::All, "Show the last reply of which session?").await?;
+            let s = get_session(&id).await?;
             match s.last_message {
                 Some(m) => println!("{m}"),
                 None => bail!("session {} has not finished a turn yet", s.short_id()),
@@ -590,65 +594,68 @@ fn run(command: Command) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Kill { session } => {
-            let id = pick(session, Offer::Running, "Kill which session?")?;
-            client::request(&Request::Kill { id })?;
+            let id = pick(session, Offer::Running, "Kill which session?").await?;
+            client::request(&Request::Kill { id }).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Resume { session } => {
-            let id = pick(session, Offer::Resumable, "Resume which session?")?;
-            client::request(&Request::Resume { id })?;
+            let id = pick(session, Offer::Resumable, "Resume which session?").await?;
+            client::request(&Request::Resume { id }).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Rm { sessions } => {
-            for id in select::many(&list_sessions()?, &sessions.sessions, Offer::All, "Remove which sessions?")? {
-                client::request(&Request::Remove { id })?;
+            for id in select::many(&list_sessions().await?, &sessions.sessions, Offer::All, "Remove which sessions?")? {
+                client::request(&Request::Remove { id }).await?;
             }
             Ok(ExitCode::SUCCESS)
         }
         Command::Describe { description, clear, session } => {
-            let id = pick(session, Offer::All, "Describe which session?")?;
+            let id = pick(session, Offer::All, "Describe which session?").await?;
             let description = if clear { None } else { description };
-            client::request(&Request::Describe { id, description })?;
+            client::request(&Request::Describe { id, description }).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Shutdown => {
-            if !client::shutdown()? {
+            if !client::shutdown().await? {
                 eprintln!("claude-mux: daemon is not running");
             }
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon => {
-            if let claude_mux::daemon::Started::AlreadyRunning = claude_mux::daemon::run()? {
+            if let claude_mux::daemon::Started::AlreadyRunning = claude_mux::daemon::run().await? {
                 eprintln!("claude-mux: daemon already running for {}", paths::home().display());
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Upgrade { version, force, yes } => upgrade_cmd(version, force, yes),
+        Command::Upgrade { version, force, yes } => upgrade_cmd(version, force, yes).await,
         Command::Hook { event } => {
-            hooks::run_hook(&event);
+            hooks::run_hook(&event).await;
             Ok(ExitCode::SUCCESS)
         }
     }
 }
 
-fn upgrade_cmd(version: Option<String>, force: bool, yes: bool) -> Result<ExitCode> {
-    let tag = upgrade::resolve_tag(version)?;
+async fn upgrade_cmd(version: Option<String>, force: bool, yes: bool) -> Result<ExitCode> {
+    let tag = upgrade::resolve_tag(version).await?;
     let current = format!("v{}", client::VERSION);
     if tag == current && !force {
         println!("claude-mux {current} is already up to date");
         return Ok(ExitCode::SUCCESS);
     }
 
-    let daemon = client::daemon_version();
+    let daemon = client::daemon_version().await;
     if let Some(daemon_version) = &daemon {
         // Ask the daemon directly: it may be a different version, which `client::request` refuses.
-        let sessions = client::connect_existing().and_then(|mut conn| {
-            conn.send(&Request::List).ok()?;
-            match conn.recv::<Response>() {
-                Ok(Some(Response::Sessions { sessions })) => Some(sessions),
-                _ => None,
-            }
-        });
+        let sessions = match client::connect_existing().await {
+            Some(mut conn) => match conn.send(&Request::List).await {
+                Ok(()) => match conn.recv::<Response>().await {
+                    Ok(Some(Response::Sessions { sessions })) => Some(sessions),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
+            None => None,
+        };
         let running: Option<Vec<SessionInfo>> =
             sessions.map(|s| s.into_iter().filter(|s| s.status.is_live() && !s.asleep).collect());
         let ask = match &running {
@@ -667,24 +674,24 @@ fn upgrade_cmd(version: Option<String>, force: bool, yes: bool) -> Result<ExitCo
                 true
             }
         };
-        if ask && !yes && !confirm("Upgrade and restart the daemon?")? {
+        if ask && !yes && !confirm("Upgrade and restart the daemon?").await? {
             eprintln!("Not upgrading.");
             return Ok(ExitCode::FAILURE);
         }
     }
 
-    let exe = upgrade::install(&tag)?;
+    let exe = upgrade::install(&tag).await?;
     println!("Upgraded claude-mux {current} → {tag} at {}", exe.display());
     if daemon.is_some() {
-        client::shutdown()?;
-        drop(client::connect().context("starting the new daemon")?);
+        client::shutdown().await?;
+        drop(client::connect().await.context("starting the new daemon")?);
         println!("Restarted the daemon");
     }
     Ok(ExitCode::SUCCESS)
 }
 
 /// Ask a yes/no question on the terminal; refuses when there is none to ask on.
-fn confirm(question: &str) -> Result<bool> {
+async fn confirm(question: &str) -> Result<bool> {
     use std::io::{IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
         bail!("not a terminal, so can't ask; pass --yes to proceed");
@@ -692,16 +699,16 @@ fn confirm(question: &str) -> Result<bool> {
     eprint!("{question} [y/N] ");
     std::io::stderr().flush()?;
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    BufReader::new(tokio::io::stdin()).read_line(&mut answer).await?;
     Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
-fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool, quiet: bool, json: bool) -> Result<ExitCode> {
+async fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool, quiet: bool, json: bool) -> Result<ExitCode> {
     let timeout_ms = timeout
         .map(|seconds| seconds.checked_mul(1000).ok_or_else(|| anyhow::anyhow!("timeout is too large")))
         .transpose()?;
     let req = Request::Wait { ids, any, timeout_ms, turn };
-    let Response::Wait { sessions, timed_out } = client::request(&req)? else { bail!("unexpected response") };
+    let Response::Wait { sessions, timed_out } = client::request(&req).await? else { bail!("unexpected response") };
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else {
@@ -797,8 +804,8 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
-fn peek_plain(id: &str) -> Option<String> {
-    match client::request(&Request::Peek { id: id.to_string(), ansi: false }) {
+async fn peek_plain(id: &str) -> Option<String> {
+    match client::request(&Request::Peek { id: id.to_string(), ansi: false }).await {
         Ok(Response::Text { text }) => Some(text),
         _ => None,
     }
@@ -824,14 +831,14 @@ fn ask_from_screen(dialog: Dialog) -> hooks::Ask {
     }
 }
 
-fn questions_cmd(cmd: Option<QuestionsCmd>, session: Option<String>, json: bool) -> Result<ExitCode> {
-    let mut sessions = list_sessions()?;
+async fn questions_cmd(cmd: Option<QuestionsCmd>, session: Option<String>, json: bool) -> Result<ExitCode> {
+    let mut sessions = list_sessions().await?;
     if let Some(query) = session {
         let id = select::one(&sessions, Some(&query), Offer::All, "Questions from which session?")?;
         sessions.retain(|s| s.id == id);
     }
-    let mut rows = waiting_rows(sessions);
-    let mut store = load_answers()?;
+    let mut rows = waiting_rows(sessions).await;
+    let mut store = load_answers().await?;
     attach_recorded(&mut rows, &store);
     match cmd {
         None => {
@@ -844,13 +851,13 @@ fn questions_cmd(cmd: Option<QuestionsCmd>, session: Option<String>, json: bool)
             }
         }
         Some(QuestionsCmd::Answer { question, selection, notes }) => {
-            record_answer(&mut store, &rows, &question, &selection, notes)?;
+            record_answer(&mut store, &rows, &question, &selection, notes).await?;
         }
         Some(QuestionsCmd::Chat { message }) => {
-            let message = read_arg(message)?;
-            chat_about(&mut store, &rows, &message)?;
+            let message = read_arg(message).await?;
+            chat_about(&mut store, &rows, &message).await?;
         }
-        Some(QuestionsCmd::Submit) => submit_answers(&mut store, &rows)?,
+        Some(QuestionsCmd::Submit) => submit_answers(&mut store, &rows).await?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -936,7 +943,7 @@ fn find_question<'a>(rows: &'a [WaitingRow], query: &str) -> Result<Found<'a>> {
     }
 }
 
-fn record_answer(store: &mut AnswerStore, rows: &[WaitingRow], query: &str, selection: &str, notes: Option<String>) -> Result<()> {
+async fn record_answer(store: &mut AnswerStore, rows: &[WaitingRow], query: &str, selection: &str, notes: Option<String>) -> Result<()> {
     let found = find_question(rows, query)?;
     let question = &found.ask.questions[found.index];
     let options = parse_selection(selection)?;
@@ -963,7 +970,7 @@ fn record_answer(store: &mut AnswerStore, rows: &[WaitingRow], query: &str, sele
     staged.answers.retain(|a| a.index != found.index);
     staged.answers.push(StagedPick { index: found.index, options: options.clone(), notes: notes.clone() });
     staged.answers.sort_by_key(|a| a.index);
-    save_answers(store)?;
+    save_answers(store).await?;
     let nums = options.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
     println!("{}  {}  {nums}", short_id(found.session_id), question_name(question));
     if let Some(notes) = &notes {
@@ -995,7 +1002,7 @@ fn sole_dialog(rows: &[WaitingRow]) -> Result<&WaitingRow> {
     }
 }
 
-fn chat_about(store: &mut AnswerStore, rows: &[WaitingRow], message: &str) -> Result<()> {
+async fn chat_about(store: &mut AnswerStore, rows: &[WaitingRow], message: &str) -> Result<()> {
     let message = message.trim();
     if message.is_empty() {
         bail!("chat message is empty");
@@ -1006,15 +1013,15 @@ fn chat_about(store: &mut AnswerStore, rows: &[WaitingRow], message: &str) -> Re
     }
     let question = row.dialog.as_ref().and_then(|ask| ask.questions.first()).context("no question is waiting")?;
     let n = chat_option(question)?;
-    press(&row.session.id, &[n.to_string()])?;
-    client::request(&Request::Send { id: row.session.id.clone(), message: message.to_string(), now: false })?;
+    press(&row.session.id, &[n.to_string()]).await?;
+    client::request(&Request::Send { id: row.session.id.clone(), message: message.to_string(), now: false }).await?;
     store.sessions.remove(&row.session.id);
-    save_answers(store)?;
+    save_answers(store).await?;
     println!("{}  chat", row.session.short_id());
     Ok(())
 }
 
-fn submit_answers(store: &mut AnswerStore, rows: &[WaitingRow]) -> Result<()> {
+async fn submit_answers(store: &mut AnswerStore, rows: &[WaitingRow]) -> Result<()> {
     let mut submitted = 0;
     for row in rows {
         let Some(ask) = &row.dialog else { continue };
@@ -1025,13 +1032,14 @@ fn submit_answers(store: &mut AnswerStore, rows: &[WaitingRow]) -> Result<()> {
             }
             staged.answers.clone()
         };
-        let notes_ui = !row.screen && peek_plain(&row.session.id).is_some_and(|s| s.to_ascii_lowercase().contains("add notes"));
+        let notes_ui = !row.screen
+            && peek_plain(&row.session.id).await.is_some_and(|s| s.to_ascii_lowercase().contains("add notes"));
         let steps = submit_steps(ask, &picks, row.screen, notes_ui)?;
         for step in &steps {
-            press(&row.session.id, step)?;
+            press(&row.session.id, step).await?;
         }
         store.sessions.remove(&row.session.id);
-        save_answers(store)?;
+        save_answers(store).await?;
         println!("submitted {}", row.session.short_id());
         submitted += 1;
     }
@@ -1041,12 +1049,12 @@ fn submit_answers(store: &mut AnswerStore, rows: &[WaitingRow]) -> Result<()> {
     Ok(())
 }
 
-fn press(id: &str, keys: &[String]) -> Result<()> {
+async fn press(id: &str, keys: &[String]) -> Result<()> {
     let mut parsed = Vec::with_capacity(keys.len());
     for key in keys {
         parsed.push(KeyInput::parse(key).with_context(|| format!("key `{key}`"))?);
     }
-    client::request(&Request::Keys { id: id.to_string(), keys: parsed })?;
+    client::request(&Request::Keys { id: id.to_string(), keys: parsed }).await?;
     Ok(())
 }
 
@@ -1181,22 +1189,23 @@ fn answers_path() -> std::path::PathBuf {
     paths::home().join("waiting.json")
 }
 
-fn load_answers() -> Result<AnswerStore> {
+async fn load_answers() -> Result<AnswerStore> {
     let path = answers_path();
-    if !path.exists() {
-        return Ok(AnswerStore::default());
-    }
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AnswerStore::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-fn save_answers(store: &AnswerStore) -> Result<()> {
+async fn save_answers(store: &AnswerStore) -> Result<()> {
     let path = answers_path();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        tokio::fs::create_dir_all(dir).await?;
     }
     let text = serde_json::to_string_pretty(store)?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    tokio::fs::write(&path, text).await.with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -1222,20 +1231,20 @@ fn attach_recorded(rows: &mut [WaitingRow], store: &AnswerStore) {
 /// which does not go through the permission-dialog screen parser. A session
 /// counts even when its status is still `working`. Other dialogs fall back
 /// to the live screen.
-fn waiting_rows(mut sessions: Vec<SessionInfo>) -> Vec<WaitingRow> {
+async fn waiting_rows(mut sessions: Vec<SessionInfo>) -> Vec<WaitingRow> {
     order_waiting(&mut sessions);
     let mut rows = Vec::new();
     for session in sessions {
         if session.status == Status::Exited {
             continue;
         }
-        let mut ask = hooks::pending_ask_for(&session.cwd, &session.id);
+        let mut ask = hooks::pending_ask_for(&session.cwd, &session.id).await;
         let mut from_screen = false;
         if !counts_as_waiting(&session, ask.is_some()) {
             continue;
         }
         if ask.is_none() && session.effective_status() == Status::NeedsInput {
-            ask = peek_plain(&session.id).as_deref().and_then(parse_dialog).map(ask_from_screen);
+            ask = peek_plain(&session.id).await.as_deref().and_then(parse_dialog).map(ask_from_screen);
             from_screen = ask.is_some();
         }
         rows.push(WaitingRow { session, dialog: ask, screen: from_screen, recorded: Vec::new() });

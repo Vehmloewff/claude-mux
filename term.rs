@@ -6,6 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -19,6 +20,7 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Processor, Rgb, StdSyncHandler};
 use serde::Serialize;
+use tokio::sync::oneshot;
 use unicode_width::UnicodeWidthStr;
 
 use crate::protocol::{self, CellStyle, Color, KeyCode, KeyInput, Screen, Span};
@@ -45,8 +47,8 @@ enum Msg {
     Paste(String),
     Scroll { delta: i32, col: u16, row: u16 },
     ScrollReset,
-    Snapshot(Sender<Screen>),
-    Text { scrollback: bool, ansi: bool, reply: Sender<String> },
+    Snapshot(oneshot::Sender<Screen>),
+    Text { scrollback: bool, ansi: bool, reply: oneshot::Sender<String> },
 }
 
 #[derive(Clone)]
@@ -87,15 +89,25 @@ impl TermHandle {
     pub fn scroll_reset(&self) {
         let _ = self.tx.send(Msg::ScrollReset);
     }
-    pub fn snapshot(&self) -> Option<Screen> {
-        let (tx, rx) = mpsc::channel();
-        self.tx.send(Msg::Snapshot(tx)).ok()?;
-        rx.recv_timeout(Duration::from_secs(2)).ok()
+    pub fn snapshot(&self) -> impl Future<Output = Option<Screen>> + Send {
+        let (tx, rx) = oneshot::channel();
+        let sent = self.tx.send(Msg::Snapshot(tx)).is_ok();
+        async move {
+            if !sent {
+                return None;
+            }
+            tokio::time::timeout(Duration::from_secs(2), rx).await.ok().and_then(|r| r.ok())
+        }
     }
-    pub fn text(&self, scrollback: bool, ansi: bool) -> Option<String> {
-        let (tx, rx) = mpsc::channel();
-        self.tx.send(Msg::Text { scrollback, ansi, reply: tx }).ok()?;
-        rx.recv_timeout(Duration::from_secs(2)).ok()
+    pub fn text(&self, scrollback: bool, ansi: bool) -> impl Future<Output = Option<String>> + Send {
+        let (tx, rx) = oneshot::channel();
+        let sent = self.tx.send(Msg::Text { scrollback, ansi, reply: tx }).is_ok();
+        async move {
+            if !sent {
+                return None;
+            }
+            tokio::time::timeout(Duration::from_secs(2), rx).await.ok().and_then(|r| r.ok())
+        }
     }
 }
 

@@ -5,13 +5,13 @@
 //! daemon, which is how claude-mux knows when a session is working, blocked on
 //! a permission prompt, or done with its turn.
 
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::net::UnixStream;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 
 use crate::paths;
 use crate::protocol::Request;
@@ -48,23 +48,21 @@ pub fn settings_json() -> String {
 
 /// Entry point for `claude-mux hook <event>`. Never fails loudly: a broken
 /// daemon must not break the claude session.
-pub fn run_hook(event: &str) {
+pub async fn run_hook(event: &str) {
     let Ok(process) = std::env::var("CLAUDE_MUX_PROCESS") else { return };
     let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
+    let _ = tokio::io::stdin().read_to_string(&mut input).await;
     let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
     let req = Request::Hook { process, event: event.to_string(), payload };
-    let Ok(stream) = UnixStream::connect(paths::socket()) else { return };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let Ok(stream) = UnixStream::connect(paths::socket()).await else { return };
     let Ok(mut line) = serde_json::to_vec(&req) else { return };
     line.push(b'\n');
-    let mut writer = &stream;
-    if writer.write_all(&line).is_err() {
-        return;
-    }
+    let (mut reader, mut writer) = stream.into_split();
+    let write = async { writer.write_all(&line).await };
     let mut ack = String::new();
-    let _ = BufReader::new(&stream).read_line(&mut ack);
+    let read = async { BufReader::new(&mut reader).read_line(&mut ack).await };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), write).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), read).await;
 }
 
 /// One plan-mode question Claude is waiting on. Read from the session
@@ -117,23 +115,23 @@ pub fn transcript_path(cwd: &str, session_id: &str) -> Option<PathBuf> {
 
 /// The `AskUserQuestion` Claude is blocked on, if the transcript has one
 /// with no later tool result.
-pub fn pending_ask_for(cwd: &str, session_id: &str) -> Option<Ask> {
+pub async fn pending_ask_for(cwd: &str, session_id: &str) -> Option<Ask> {
     let path = transcript_path(cwd, session_id)?;
-    pending_ask(&read_transcript_tail(&path)?)
+    pending_ask(&read_transcript_tail(&path).await?)
 }
 
 /// A pending question is the last thing written, so the tail of the file is
 /// enough. Whole transcripts run to tens of megabytes.
-fn read_transcript_tail(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+async fn read_transcript_tail(path: &Path) -> Option<String> {
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let len = file.metadata().await.ok()?.len();
     const MAX: u64 = 1024 * 1024;
     let truncated = len > MAX;
     if truncated {
-        file.seek(SeekFrom::Start(len - MAX)).ok()?;
+        file.seek(SeekFrom::Start(len - MAX)).await.ok()?;
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
+    file.read_to_end(&mut bytes).await.ok()?;
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     if truncated && let Some(i) = text.find('\n') {
         text.drain(..=i);
@@ -208,13 +206,13 @@ fn nonempty(v: &Value, key: &str) -> Option<String> {
 
 /// Pull the final assistant text out of a Stop hook payload, falling back
 /// to the transcript file for older Claude Code versions.
-pub fn last_assistant_message(payload: &Value) -> Option<String> {
+pub async fn last_assistant_message(payload: &Value) -> Option<String> {
     if let Some(msg) = payload.get("last_assistant_message").and_then(Value::as_str)
         && !msg.trim().is_empty() {
             return Some(msg.to_string());
         }
     let path = payload.get("transcript_path")?.as_str()?;
-    let data = std::fs::read_to_string(path).ok()?;
+    let data = tokio::fs::read_to_string(path).await.ok()?;
     data.lines().rev().find_map(|line| {
         let entry: Value = serde_json::from_str(line).ok()?;
         if entry.get("type")?.as_str()? != "assistant" {
@@ -265,9 +263,15 @@ mod tests {
         )
         .unwrap();
         let payload = json!({ "transcript_path": path });
-        assert_eq!(last_assistant_message(&payload).as_deref(), Some("done!"));
+        assert_eq!(
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(last_assistant_message(&payload)).as_deref(),
+            Some("done!")
+        );
         let direct = json!({ "last_assistant_message": "direct", "transcript_path": path });
-        assert_eq!(last_assistant_message(&direct).as_deref(), Some("direct"));
+        assert_eq!(
+            tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(last_assistant_message(&direct)).as_deref(),
+            Some("direct")
+        );
     }
 
     fn ask_line(id: &str, body: &str) -> String {

@@ -1,59 +1,57 @@
 //! Client side of the daemon socket, including starting the daemon on demand.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
+use tokio::process::Command;
 
 use crate::paths;
 use crate::protocol::{Request, Response};
 
 pub struct Conn {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
 }
 
 impl Conn {
-    pub fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
+    pub async fn send<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
         let mut line = serde_json::to_vec(msg)?;
         line.push(b'\n');
-        self.writer.write_all(&line)?;
+        self.writer.write_all(&line).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 
-    pub fn recv<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
+    pub async fn recv<T: serde::de::DeserializeOwned>(&mut self) -> Result<Option<T>> {
         let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
+        if self.reader.read_line(&mut line).await? == 0 {
             return Ok(None);
         }
         Ok(Some(serde_json::from_str(&line).context("bad message from daemon")?))
     }
 
-    pub fn writer(&self) -> Result<UnixStream> {
-        Ok(self.writer.try_clone()?)
-    }
-
-    pub fn into_reader(self) -> BufReader<UnixStream> {
-        self.reader
+    /// Split into the reading and writing halves, for long-lived streams.
+    pub fn into_split(self) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+        (self.reader, self.writer)
     }
 }
 
-fn try_connect() -> Option<Conn> {
-    let stream = UnixStream::connect(paths::socket()).ok()?;
-    let writer = stream.try_clone().ok()?;
-    Some(Conn { reader: BufReader::new(stream), writer })
+async fn try_connect() -> Option<Conn> {
+    let stream = UnixStream::connect(paths::socket()).await.ok()?;
+    let (reader, writer) = stream.into_split();
+    Some(Conn { reader: BufReader::new(reader), writer })
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Version of the running daemon, or None if no daemon is running.
-pub fn daemon_version() -> Option<String> {
-    let mut conn = try_connect()?;
-    conn.send(&Request::Ping).ok()?;
-    match conn.recv::<Response>() {
+pub async fn daemon_version() -> Option<String> {
+    let mut conn = try_connect().await?;
+    conn.send(&Request::Ping).await.ok()?;
+    match conn.recv::<Response>().await {
         Ok(Some(Response::Pong { version })) => Some(version),
         _ => Some("unknown".into()),
     }
@@ -62,25 +60,25 @@ pub fn daemon_version() -> Option<String> {
 /// Connect to the daemon, starting `claude-mux daemon` first if it isn't running.
 /// Refuses a daemon from a different claude-mux version: the CLI and the
 /// daemon always run the same build.
-pub fn connect() -> Result<Conn> {
-    if let Some(version) = daemon_version() {
+pub async fn connect() -> Result<Conn> {
+    if let Some(version) = daemon_version().await {
         if version != VERSION {
             bail!(
                 "the running daemon is claude-mux {version}, but this is {VERSION}. Run `claude-mux shutdown` \
                  to stop it (running sessions stop and can be resumed); the next command starts a matching daemon"
             );
         }
-        if let Some(conn) = try_connect() {
+        if let Some(conn) = try_connect().await {
             return Ok(conn);
         }
     }
-    spawn_daemon()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Some(conn) = try_connect() {
+    spawn_daemon().await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(conn) = try_connect().await {
             return Ok(conn);
         }
-        std::thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     bail!(
         "started the daemon but it isn't answering at {} (see {})",
@@ -90,49 +88,64 @@ pub fn connect() -> Result<Conn> {
 }
 
 /// Connect only if a daemon is already running (never starts one).
-pub fn connect_existing() -> Option<Conn> {
-    try_connect()
+pub async fn connect_existing() -> Option<Conn> {
+    try_connect().await
 }
 
 /// Stop the daemon (whatever its version) and wait for it to finish stopping
 /// sessions. Returns false if no daemon was running.
-pub fn shutdown() -> Result<bool> {
-    let Some(mut conn) = try_connect() else { return Ok(false) };
-    conn.send(&Request::Shutdown)?;
-    let _ = conn.recv::<Response>();
+pub async fn shutdown() -> Result<bool> {
+    let Some(mut conn) = try_connect().await else { return Ok(false) };
+    conn.send(&Request::Shutdown).await?;
+    let _ = conn.recv::<Response>().await;
     for _ in 0..100 {
-        if try_connect().is_none() {
+        if try_connect().await.is_none() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(true)
+}
+
+/// Send one request and read one response.
+pub async fn request(req: &Request) -> Result<Response> {
+    let mut conn = connect().await?;
+    conn.send(req).await?;
+    match conn.recv::<Response>().await? {
+        Some(Response::Error { message }) => bail!(message),
+        Some(resp) => Ok(resp),
+        None => bail!("daemon closed the connection"),
+    }
 }
 
 /// Start `claude-mux daemon` fully detached: double-forked so it is re-parented to
 /// init/launchd rather than staying a child of this command, in its own
 /// session, with output appended to the daemon log. If several commands race
 /// to start it, the daemon's lock file lets only one of them run.
-fn spawn_daemon() -> Result<()> {
-    std::fs::create_dir_all(paths::home())?;
+async fn spawn_daemon() -> Result<()> {
+    tokio::fs::create_dir_all(paths::home()).await?;
     let exe = paths::exe();
-    let log = std::fs::OpenOptions::new()
+    let log = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(paths::log_file())
-        .with_context(|| format!("open {}", paths::log_file().display()))?;
+        .await
+        .with_context(|| format!("open {}", paths::log_file().display()))?
+        .into_std()
+        .await;
     let mut cmd = Command::new(&exe);
     cmd.arg("daemon");
-    cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
-            // Only async-signal-safe calls here (we are between fork and exec).
             match libc::fork() {
                 -1 => return Err(std::io::Error::last_os_error()),
-                0 => {}                  // grandchild: becomes the daemon
-                _ => libc::_exit(0),     // intermediate child: exit right away
+                0 => {}              // grandchild: becomes the daemon
+                _ => libc::_exit(0), // intermediate child: exit right away
             }
-            libc::setsid();
             Ok(())
         });
     }
@@ -140,17 +153,7 @@ fn spawn_daemon() -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to start {} daemon", exe.display()))?;
     // Reap the intermediate process; the daemon itself is no longer our child.
-    let _ = child.wait();
+    // The double fork makes it exit at once, so this returns immediately.
+    let _ = child.wait().await;
     Ok(())
-}
-
-/// Send one request and read one response.
-pub fn request(req: &Request) -> Result<Response> {
-    let mut conn = connect()?;
-    conn.send(req)?;
-    match conn.recv::<Response>()? {
-        Some(Response::Error { message }) => bail!(message),
-        Some(resp) => Ok(resp),
-        None => bail!("daemon closed the connection"),
-    }
 }

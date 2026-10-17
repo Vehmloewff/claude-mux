@@ -2,16 +2,19 @@
 //! terminal emulator, and serves the CLI / TUI over a Unix socket.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixListener;
+use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::db::Db;
 use crate::hooks;
@@ -165,10 +168,14 @@ struct Inner {
 }
 
 pub struct Daemon {
-    inner: Mutex<Inner>,
+    inner: AsyncMutex<Inner>,
     /// Only used with `inner` locked, which serializes writes.
     db: Db,
-    changed: Condvar,
+    /// Carries the current `Inner::version`; watchers wait on it.
+    version_tx: watch::Sender<u64>,
+    /// Terminal events from every session's emulator thread, handled (and
+    /// persisted) in order by one task.
+    events_tx: mpsc::UnboundedSender<(String, TermEvent)>,
     shutting_down: AtomicBool,
 }
 
@@ -182,16 +189,15 @@ pub enum Started {
     AlreadyRunning,
 }
 
-pub fn run() -> Result<Started> {
-    std::fs::create_dir_all(paths::home())?;
-    std::fs::set_permissions(
-        paths::home(),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .context("restrict daemon state directory permissions")?;
+pub async fn run() -> Result<Started> {
+    tokio::fs::create_dir_all(paths::home()).await?;
+    tokio::fs::set_permissions(paths::home(), std::fs::Permissions::from_mode(0o700))
+        .await
+        .context("restrict daemon state directory permissions")?;
     // Exactly one daemon per state directory, even when several commands
     // start one at the same moment. The lock is held until the process exits
-    // (the file is close-on-exec, so sessions don't inherit it).
+    // (the file is close-on-exec, so sessions don't inherit it). The
+    // non-blocking acquire means this never waits.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -203,54 +209,72 @@ pub fn run() -> Result<Started> {
     }
     std::mem::forget(lock);
     let sock = paths::socket();
-    let db = Db::open(&paths::db_file())?;
-    let sessions = load_sessions(&db)?;
-    let _ = std::fs::remove_file(&sock);
+    let db = Db::open(&paths::db_file()).await?;
+    let sessions = load_sessions(&db).await.context("load sessions")?;
+    let _ = tokio::fs::remove_file(&sock).await;
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+    tokio::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+        .await
         .with_context(|| format!("restrict socket permissions on {}", sock.display()))?;
     eprintln!("[{}] claude-mux daemon listening on {}", paths::now(), sock.display());
 
+    let (version_tx, _) = watch::channel(1);
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<(String, TermEvent)>();
     let daemon: Shared = Arc::new(Daemon {
-        inner: Mutex::new(Inner { sessions, version: 1 }),
+        inner: AsyncMutex::new(Inner { sessions, version: 1 }),
         db,
-        changed: Condvar::new(),
+        version_tx,
+        events_tx,
         shutting_down: AtomicBool::new(false),
     });
 
     {
         let d = daemon.clone();
-        std::thread::spawn(move || ticker(d));
+        tokio::spawn(async move {
+            while let Some((process, ev)) = events_rx.recv().await {
+                on_term_event(&d, &process, ev).await;
+            }
+        });
+    }
+    {
+        let d = daemon.clone();
+        tokio::spawn(ticker(d));
     }
     {
         // SIGTERM and SIGINT stop gracefully (like `claude-mux shutdown`), leaving
-        // sessions resumable. The handler only sets a flag; this thread acts.
+        // sessions resumable. Being handled (not ignored or blocked), they reset
+        // to their defaults on exec, so the claude children are unaffected.
         let d = daemon.clone();
-        install_signal_handlers();
-        std::thread::spawn(move || {
-            while !STOP_SIGNAL.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(100));
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
             }
             eprintln!("[{}] received stop signal", paths::now());
-            shutdown(&d);
+            shutdown(&d).await;
         });
     }
 
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(_) => continue,
+        };
         let d = daemon.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = handle_conn(&d, stream) {
+        tokio::spawn(async move {
+            if let Err(e) = handle_conn(&d, stream).await {
                 eprintln!("connection error: {e:#}");
             }
         });
     }
-    Ok(Started::Ran)
 }
 
-fn load_sessions(db: &Db) -> Result<BTreeMap<String, Session>> {
+async fn load_sessions(db: &Db) -> Result<BTreeMap<String, Session>> {
     let mut map = BTreeMap::new();
-    for mut info in db.load_sessions().context("load sessions")? {
+    for mut info in db.load_sessions().await.context("load sessions")? {
         // Asleep sessions stay asleep: they wake on the next message.
         if info.status.is_live() && !info.asleep {
             info.status = Status::Stopped;
@@ -263,17 +287,26 @@ fn load_sessions(db: &Db) -> Result<BTreeMap<String, Session>> {
 }
 
 impl Daemon {
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().await
     }
 
     /// Record that session info changed: persist and wake watchers.
-    fn touch(&self, inner: &mut Inner) {
+    async fn touch(&self, inner: &mut Inner) {
         inner.version += 1;
-        if let Err(e) = self.db.save_sessions(inner.sessions.values().map(|s| &s.info)) {
+        // Collected eagerly: a lazy iterator would hold borrows of `Session`
+        // (and its non-Sync PTY handles) across the save below.
+        let infos: Vec<&SessionInfo> = inner.sessions.values().map(|s| &s.info).collect();
+        if let Err(e) = self.db.save_sessions(infos).await {
             eprintln!("[{}] failed to save sessions: {e:#}", paths::now());
         }
-        self.changed.notify_all();
+        let _ = self.version_tx.send(inner.version);
+    }
+
+    /// Wake every watcher (e.g. a subscribed client went away).
+    fn poke_watchers(&self) {
+        let version = self.inner.try_lock().map(|inner| inner.version).unwrap_or(0);
+        let _ = self.version_tx.send(version);
     }
 }
 
@@ -289,32 +322,32 @@ fn set_status(s: &mut Session, status: Status, detail: Option<String>) {
 // ---------------------------------------------------------------------------
 // Connections
 
-fn write_line<T: serde::Serialize>(w: &mut impl Write, msg: &T) -> Result<()> {
+async fn write_line<T: serde::Serialize>(w: &mut (impl tokio::io::AsyncWrite + Unpin), msg: &T) -> Result<()> {
     let mut line = serde_json::to_vec(msg)?;
     line.push(b'\n');
-    w.write_all(&line)?;
-    w.flush()?;
+    w.write_all(&line).await?;
+    w.flush().await?;
     Ok(())
 }
 
-fn handle_conn(d: &Shared, stream: UnixStream) -> Result<()> {
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
+async fn handle_conn(d: &Shared, stream: tokio::net::UnixStream) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    if reader.read_line(&mut line).await? == 0 {
         return Ok(());
     }
     let req: Request = serde_json::from_str(&line).context("invalid request")?;
     match req {
-        Request::Subscribe => subscribe(d, reader, writer),
+        Request::Subscribe => subscribe(d, reader, writer).await,
         Request::Shutdown => {
-            write_line(&mut writer, &Response::Ok)?;
-            shutdown(d);
+            write_line(&mut writer, &Response::Ok).await?;
+            shutdown(d).await;
             Ok(())
         }
         req => {
-            let resp = handle_request(d, req).unwrap_or_else(|e| Response::Error { message: format!("{e:#}") });
-            write_line(&mut writer, &resp)
+            let resp = handle_request(d, req).await.unwrap_or_else(|e| Response::Error { message: format!("{e:#}") });
+            write_line(&mut writer, &resp).await
         }
     }
 }
@@ -339,15 +372,15 @@ fn not_running(info: &SessionInfo) -> anyhow::Error {
     }
 }
 
-fn handle_request(d: &Shared, req: Request) -> Result<Response> {
+async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
     match req {
         Request::Ping => Ok(Response::Pong { version: env!("CARGO_PKG_VERSION").into() }),
         Request::Create(c) => {
-            let info = create(d, c)?;
+            let info = create(d, c).await?;
             Ok(Response::Session { session: info })
         }
         Request::Send { id, message, now } => {
-            let mut inner = d.lock();
+            let mut inner = d.lock().await;
             let s = session_mut(&mut inner, &id)?;
             if !s.info.status.is_live() {
                 return Err(not_running(&s.info));
@@ -357,7 +390,7 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
                 s.queue.push_back(message);
                 s.info.queued = s.queue.len();
                 if s.info.asleep {
-                    wake(d, s)?;
+                    wake(d, s).await?;
                 }
             } else if now {
                 type_message(s, message);
@@ -367,29 +400,29 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
                 deliver_if_ready(s);
             }
             let info = s.info.clone();
-            d.touch(&mut inner);
+            d.touch(&mut inner).await;
             Ok(Response::Session { session: info })
         }
-        Request::Wait { ids, any, timeout_ms, turn } => wait(d, ids, any, timeout_ms, turn),
+        Request::Wait { ids, any, timeout_ms, turn } => wait(d, ids, any, timeout_ms, turn).await,
         Request::List => {
-            let inner = d.lock();
+            let inner = d.lock().await;
             Ok(Response::Sessions { sessions: inner.sessions.values().map(|s| s.info.clone()).collect() })
         }
         Request::Get { id } => {
-            let mut inner = d.lock();
-            Ok(Response::Session { session: session_mut(&mut inner, &id)?.info.clone() })
+            let inner = d.lock().await;
+            Ok(Response::Session { session: inner.sessions.get(&id).ok_or_else(|| anyhow!("no session with id '{id}'"))?.info.clone() })
         }
         Request::Peek { id, ansi } => {
             let term = {
-                let mut inner = d.lock();
+                let mut inner = d.lock().await;
                 let s = session_mut(&mut inner, &id)?;
                 s.term.clone().ok_or_else(|| not_running(&s.info))?
             };
-            let text = term.text(false, ansi).ok_or_else(|| anyhow!("terminal did not respond"))?;
+            let text = term.text(false, ansi).await.ok_or_else(|| anyhow!("terminal did not respond"))?;
             Ok(Response::Text { text })
         }
         Request::Kill { id } => {
-            let mut inner = d.lock();
+            let mut inner = d.lock().await;
             let s = session_mut(&mut inner, &id)?;
             if let Some(p) = s.proc.as_mut() {
                 s.killed = true;
@@ -401,40 +434,40 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             s.queue.clear();
             s.info.queued = 0;
             s.wake_input.clear();
-            d.touch(&mut inner);
+            d.touch(&mut inner).await;
             Ok(Response::Ok)
         }
         Request::Remove { id } => {
-            let mut inner = d.lock();
+            let mut inner = d.lock().await;
             let mut s = inner.sessions.remove(&id).ok_or_else(|| anyhow!("no session with id '{id}'"))?;
             if let Some(p) = s.proc.as_mut() {
                 let _ = p.killer.kill();
             }
-            d.touch(&mut inner);
+            d.touch(&mut inner).await;
             Ok(Response::Ok)
         }
         Request::Resume { id } => {
-            let info = resume(d, &id)?;
+            let info = resume(d, &id).await?;
             Ok(Response::Session { session: info })
         }
         Request::Describe { id, description } => {
-            let mut inner = d.lock();
+            let mut inner = d.lock().await;
             let s = session_mut(&mut inner, &id)?;
             s.info.description = description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
             let info = s.info.clone();
-            d.touch(&mut inner);
+            d.touch(&mut inner).await;
             Ok(Response::Session { session: info })
         }
         Request::Keys { id, keys } => {
             let term = {
-                let mut inner = d.lock();
+                let mut inner = d.lock().await;
                 let s = session_mut(&mut inner, &id)?;
                 if s.info.asleep || s.falling_asleep {
                     s.wake_input.extend(keys.into_iter().map(WakeInput::Key));
                     if s.info.asleep {
-                        wake(d, s)?;
+                        wake(d, s).await?;
                     }
-                    d.touch(&mut inner);
+                    d.touch(&mut inner).await;
                     return Ok(Response::Ok);
                 }
                 if !s.info.status.is_live() {
@@ -446,22 +479,25 @@ fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             };
             for key in keys {
                 term.key(key);
-                std::thread::sleep(Duration::from_millis(30));
+                tokio::time::sleep(Duration::from_millis(30)).await;
             }
             // Let claude redraw and the dialog scan catch up, so an immediate
             // `wait` sees the post-keypress status.
-            std::thread::sleep(Duration::from_millis(600));
+            tokio::time::sleep(Duration::from_millis(600)).await;
             Ok(Response::Ok)
         }
         Request::Hook { process, event, payload } => {
-            on_hook(d, &process, &event, payload);
+            on_hook(d, &process, &event, payload).await;
             Ok(Response::Ok)
         }
         Request::Shutdown | Request::Subscribe => unreachable!(),
     }
 }
 
-fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, turn: bool) -> Result<Response> {
+async fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, turn: bool) -> Result<Response> {
+    if ids.is_empty() {
+        bail!("no session ids given");
+    }
     let deadline = timeout_ms
         .map(|ms| {
             Instant::now()
@@ -469,15 +505,23 @@ fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, turn: 
                 .ok_or_else(|| anyhow!("timeout is too large"))
         })
         .transpose()?;
-    let mut inner = d.lock();
-    if ids.is_empty() {
-        bail!("no session ids given");
-    }
+    let mut version_rx = d.version_tx.subscribe();
     loop {
-        let mut infos = Vec::new();
-        for id in &ids {
-            infos.push(session_mut(&mut inner, id)?.info.clone());
-        }
+        let infos = {
+            let inner = d.lock().await;
+            let mut infos = Vec::new();
+            for id in &ids {
+                infos.push(
+                    inner
+                        .sessions
+                        .get(id)
+                        .ok_or_else(|| anyhow!("no session with id '{id}'"))?
+                        .info
+                        .clone(),
+                );
+            }
+            infos
+        };
         let done = |s: Status| if turn { s.is_turn_over() } else { s.is_settled() };
         let settled = infos.iter().filter(|i| done(i.effective_status())).count();
         if (any && settled > 0) || settled == infos.len() {
@@ -493,19 +537,22 @@ fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, turn: 
             }
             None => Duration::from_secs(5),
         };
-        inner = d.changed.wait_timeout(inner, wait_for).unwrap_or_else(|e| e.into_inner()).0;
+        // Wait until any session info changes (or the slice of the deadline
+        // runs out, after which the settled check above decides).
+        let _ = version_rx.borrow_and_update();
+        let _ = tokio::time::timeout(wait_for, version_rx.changed()).await;
     }
 }
 
 // ---------------------------------------------------------------------------
 // Session lifecycle
 
-fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
+async fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
     let cwd = std::path::PathBuf::from(&c.cwd);
     if !cwd.is_dir() {
         bail!("working directory '{}' does not exist", c.cwd);
     }
-    let mut inner = d.lock();
+    let mut inner = d.lock().await;
     // Claude is started with this id for its conversation.
     let id = uuid::Uuid::new_v4().to_string();
     let now = paths::now();
@@ -538,17 +585,17 @@ fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
     spawn_claude(d, &mut session, false)?;
     let info = session.info.clone();
     inner.sessions.insert(id, session);
-    d.touch(&mut inner);
+    d.touch(&mut inner).await;
     Ok(info)
 }
 
-fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
-    let mut inner = d.lock();
+async fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
+    let mut inner = d.lock().await;
     let s = session_mut(&mut inner, id)?;
     if s.info.asleep {
-        wake(d, s)?;
+        wake(d, s).await?;
         let info = s.info.clone();
-        d.touch(&mut inner);
+        d.touch(&mut inner).await;
         return Ok(info);
     }
     if s.info.status.is_live() {
@@ -563,13 +610,13 @@ fn resume(d: &Shared, id: &str) -> Result<SessionInfo> {
     set_status(s, Status::Starting, Some("resuming".into()));
     spawn_claude(d, s, true)?;
     let info = s.info.clone();
-    d.touch(&mut inner);
+    d.touch(&mut inner).await;
     Ok(info)
 }
 
 /// Restart an asleep session's claude, continuing its conversation. Queued
 /// messages and keys are delivered once it is back at its prompt.
-fn wake(d: &Shared, s: &mut Session) -> Result<()> {
+async fn wake(d: &Shared, s: &mut Session) -> Result<()> {
     s.info.asleep = false;
     s.idle_since = None;
     s.initial_pending = false;
@@ -639,12 +686,15 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     let writer: PtyWriter = Arc::new(Mutex::new(pty.master.take_writer()?));
 
     let term = {
-        let d = d.clone();
+        let events_tx = d.events_tx.clone();
         let process = process.clone();
-        TermHandle::spawn(cols, rows, writer, move |ev| on_term_event(&d, &process, ev))
+        TermHandle::spawn(cols, rows, writer, move |ev| {
+            let _ = events_tx.send((process.clone(), ev));
+        })
     };
 
-    // PTY output -> terminal emulator.
+    // PTY output -> terminal emulator. A dedicated thread, since the PTY
+    // reader only offers blocking IO.
     {
         let term = term.clone();
         std::thread::spawn(move || {
@@ -658,46 +708,15 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
         });
     }
 
-    // Process exit.
+    // Process exit. The child handle is blocking too: wait for it on a
+    // dedicated thread, then hop back into the runtime to record the exit.
     {
         let d = d.clone();
         let process = process.clone();
+        let runtime = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
             let code = child.wait().map(|s| s.exit_code() as i32).ok();
-            let mut inner = d.lock();
-            if let Some(s) = session_of(&mut inner, &process) {
-                let id = s.info.id.clone();
-                s.proc = None;
-                if std::mem::take(&mut s.falling_asleep) && !s.killed {
-                    s.info.asleep = true;
-                    s.awaiting_submit = None;
-                    s.screen_prompt = None;
-                    set_status(s, Status::Idle, None);
-                    // Something arrived while it was shutting down.
-                    if (!s.queue.is_empty() || !s.wake_input.is_empty())
-                        && !d.shutting_down.load(Ordering::SeqCst)
-                        && let Err(e) = wake(&d, s)
-                    {
-                        eprintln!("[{}] failed to wake {id}: {e:#}", paths::now());
-                    }
-                    d.touch(&mut inner);
-                    return;
-                }
-                s.queue.clear();
-                s.wake_input.clear();
-                s.info.queued = 0;
-                s.info.exit_code = code;
-                s.awaiting_submit = None;
-                s.screen_prompt = None;
-                if d.shutting_down.load(Ordering::SeqCst) {
-                    set_status(s, Status::Stopped, Some("daemon shut down; resume to continue".into()));
-                } else if std::mem::take(&mut s.killed) {
-                    set_status(s, Status::Stopped, Some("killed; resume to continue".into()));
-                } else {
-                    set_status(s, Status::Exited, code.map(|c| format!("exit code {c}")));
-                }
-                d.touch(&mut inner);
-            }
+            runtime.spawn(on_process_exit(d, process, code));
         });
     }
 
@@ -707,28 +726,47 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     Ok(())
 }
 
-static STOP_SIGNAL: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_stop_signal(_: libc::c_int) {
-    STOP_SIGNAL.store(true, Ordering::SeqCst);
-}
-
-fn install_signal_handlers() {
-    // Handled (not ignored or blocked) signals reset to their defaults on
-    // exec, so the claude children are unaffected.
-    for sig in [libc::SIGTERM, libc::SIGINT] {
-        unsafe {
-            libc::signal(sig, on_stop_signal as *const () as libc::sighandler_t);
+async fn on_process_exit(d: Shared, process: String, code: Option<i32>) {
+    let mut inner = d.lock().await;
+    let Some(s) = session_of(&mut inner, &process) else { return };
+    if std::mem::take(&mut s.falling_asleep) && !s.killed {
+        s.info.asleep = true;
+        s.awaiting_submit = None;
+        s.screen_prompt = None;
+        set_status(s, Status::Idle, None);
+        // Something arrived while it was shutting down.
+        let has_pending = !s.queue.is_empty() || !s.wake_input.is_empty();
+        if has_pending && !d.shutting_down.load(Ordering::SeqCst) {
+            let id = s.info.id.clone();
+            if let Err(e) = wake(&d, s).await {
+                eprintln!("[{}] failed to wake {id}: {e:#}", paths::now());
+            }
         }
+        d.touch(&mut inner).await;
+        return;
     }
+    s.queue.clear();
+    s.wake_input.clear();
+    s.info.queued = 0;
+    s.info.exit_code = code;
+    s.awaiting_submit = None;
+    s.screen_prompt = None;
+    if d.shutting_down.load(Ordering::SeqCst) {
+        set_status(s, Status::Stopped, Some("daemon shut down; resume to continue".into()));
+    } else if std::mem::take(&mut s.killed) {
+        set_status(s, Status::Stopped, Some("killed; resume to continue".into()));
+    } else {
+        set_status(s, Status::Exited, code.map(|c| format!("exit code {c}")));
+    }
+    d.touch(&mut inner).await;
 }
 
-fn shutdown(d: &Shared) {
+async fn shutdown(d: &Shared) {
     if d.shutting_down.swap(true, Ordering::SeqCst) {
         return;
     }
     {
-        let mut inner = d.lock();
+        let mut inner = d.lock().await;
         for s in inner.sessions.values_mut() {
             if let Some(p) = s.proc.as_mut() {
                 let _ = p.killer.kill();
@@ -738,19 +776,19 @@ fn shutdown(d: &Shared) {
     // Give exit watchers a moment to record the final state.
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if d.lock().sessions.values().all(|s| s.proc.is_none()) {
+        if d.lock().await.sessions.values().all(|s| s.proc.is_none()) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let mut inner = d.lock();
+    let mut inner = d.lock().await;
     for s in inner.sessions.values_mut() {
         if s.running() {
             set_status(s, Status::Stopped, Some("daemon shut down; resume to continue".into()));
         }
     }
-    d.touch(&mut inner);
-    let _ = std::fs::remove_file(paths::socket());
+    d.touch(&mut inner).await;
+    let _ = tokio::fs::remove_file(paths::socket()).await;
     eprintln!("[{}] claude-mux daemon shut down", paths::now());
     std::process::exit(0);
 }
@@ -766,10 +804,10 @@ fn type_message(s: &mut Session, message: String) {
     if matches!(s.info.status, Status::Idle | Status::Background) {
         set_status(s, Status::Working, Some("message sent".into()));
     }
-    std::thread::spawn(move || {
+    tokio::spawn(async move {
         term.scroll_reset();
         term.paste(message.trim_end().to_string());
-        std::thread::sleep(Duration::from_millis(250));
+        tokio::time::sleep(Duration::from_millis(250)).await;
         term.key(KeyInput::plain(KeyCode::Enter));
     });
 }
@@ -791,12 +829,14 @@ fn deliver_if_ready(s: &mut Session) {
 }
 
 /// Periodic housekeeping: recover from messages that never produced a
-/// UserPromptSubmit hook (slash commands, swallowed input, ...).
-fn ticker(d: Shared) {
+/// UserPromptSubmit hook (slash commands, swallowed input, ...), and stop
+/// idle sessions' claude to free its memory.
+async fn ticker(d: Shared) {
     let sleep_after = sleep_after();
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
     loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let mut inner = d.lock();
+        interval.tick().await;
+        let mut inner = d.lock().await;
         let mut changed = false;
         for s in inner.sessions.values_mut() {
             // Stop idle sessions' claude to free its memory; it is resumed
@@ -846,7 +886,7 @@ fn ticker(d: Shared) {
             }
         }
         if changed {
-            d.touch(&mut inner);
+            d.touch(&mut inner).await;
         }
     }
 }
@@ -859,20 +899,20 @@ fn resting_status(s: &Session) -> Status {
 // ---------------------------------------------------------------------------
 // Status tracking
 
-fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
-    let mut inner = d.lock();
+async fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
+    let mut inner = d.lock().await;
     let Some(s) = session_of(&mut inner, process) else { return };
     match ev {
         TermEvent::Dirty => {
             s.screen_gen += 1;
-            d.changed.notify_all();
+            d.poke_watchers();
         }
         TermEvent::Title(title) => {
             // Keep the last meaningful title: claude resets it on exit and
             // uses its own name before it has a task summary.
             if !title.is_empty() && title != "Claude Code" && s.info.title.as_deref() != Some(&title) {
                 s.info.title = Some(title);
-                d.touch(&mut inner);
+                d.touch(&mut inner).await;
             }
         }
         TermEvent::Background(running) => {
@@ -881,7 +921,7 @@ fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
         TermEvent::Prompt(prompt) => {
             if s.info.auto_trust && prompt.as_deref() == Some(TRUST_PROMPT) {
                 if let Some(term) = s.term.clone() {
-                    std::thread::spawn(move || accept_trust(&term));
+                    tokio::spawn(accept_trust(term));
                 }
                 // Being answered for us; don't report it as needing input.
                 s.screen_prompt = prompt;
@@ -907,14 +947,14 @@ fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
                 }
                 _ => {}
             }
-            d.touch(&mut inner);
+            d.touch(&mut inner).await;
         }
     }
 }
 
 /// Move the dialog selection onto "Yes, I trust this folder" and confirm.
-fn accept_trust(term: &TermHandle) {
-    let Some(text) = term.text(false, false) else { return };
+async fn accept_trust(term: TermHandle) {
+    let Some(text) = term.text(false, false).await else { return };
     let lines: Vec<&str> = text.lines().collect();
     let selected = lines.iter().position(|l| l.trim_start().starts_with('❯'));
     let yes = lines.iter().position(|l| l.contains("Yes, I trust") || l.contains("Yes, proceed"));
@@ -923,16 +963,16 @@ fn accept_trust(term: &TermHandle) {
     for _ in 0..yes.abs_diff(selected) {
         term.key(KeyInput::plain(code.clone()));
     }
-    std::thread::sleep(Duration::from_millis(100));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     term.key(KeyInput::plain(KeyCode::Enter));
 }
 
-fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
+async fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
     if std::env::var_os("CLAUDE_MUX_DEBUG").is_some() {
         eprintln!("[{}] hook {process} {event} {payload}", paths::now());
     }
-    let last_message = (event == "Stop").then(|| hooks::last_assistant_message(&payload)).flatten();
-    let mut inner = d.lock();
+    let last_message = if event == "Stop" { hooks::last_assistant_message(&payload).await } else { None };
+    let mut inner = d.lock().await;
     let Some(mut id) = session_of(&mut inner, process).map(|s| s.info.id.clone()) else { return };
     if let Some(conversation) = payload.get("session_id").and_then(Value::as_str)
         && !conversation.is_empty()
@@ -1007,7 +1047,7 @@ fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
     if matches!(s.info.status, Status::Idle | Status::Background) {
         deliver_if_ready(s);
     }
-    d.touch(&mut inner);
+    d.touch(&mut inner).await;
 }
 
 /// Claude moved the process of session `id` to another conversation: a new
@@ -1082,13 +1122,13 @@ fn flush_wake_input(s: &mut Session) {
     s.draft_at = Some(Instant::now());
     // Hold queued messages back briefly so they don't interleave.
     s.awaiting_submit = Some((Instant::now(), Duration::from_secs(4)));
-    std::thread::spawn(move || {
+    tokio::spawn(async move {
         for ev in input {
             match ev {
                 WakeInput::Key(key) => term.key(key),
                 WakeInput::Paste(text) => term.paste(text),
             }
-            std::thread::sleep(Duration::from_millis(30));
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
     });
 }
@@ -1245,7 +1285,7 @@ struct Watch {
     dirty: bool,
 }
 
-fn subscribe(d: &Shared, reader: BufReader<UnixStream>, mut writer: UnixStream) -> Result<()> {
+async fn subscribe(d: &Shared, reader: BufReader<OwnedReadHalf>, mut writer: OwnedWriteHalf) -> Result<()> {
     let watch = Arc::new(Mutex::new(Watch::default()));
     let alive = Arc::new(AtomicBool::new(true));
 
@@ -1253,24 +1293,25 @@ fn subscribe(d: &Shared, reader: BufReader<UnixStream>, mut writer: UnixStream) 
         let d = d.clone();
         let watch = watch.clone();
         let alive = alive.clone();
-        std::thread::spawn(move || {
-            for line in reader.lines() {
-                let Ok(line) = line else { break };
+        tokio::spawn(async move {
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(ev) = serde_json::from_str::<ClientEvent>(&line) else { continue };
-                client_event(&d, &watch, ev);
+                client_event(&d, &watch, ev).await;
             }
             alive.store(false, Ordering::SeqCst);
-            d.changed.notify_all();
+            d.poke_watchers();
         });
     }
 
+    let mut version_rx = d.version_tx.subscribe();
     let mut sent_version = 0u64;
     let mut sent_screen: Option<(String, u64)> = None;
     let frame = Duration::from_millis(33);
     while alive.load(Ordering::SeqCst) {
         let started = Instant::now();
         let (sessions, screen_job) = {
-            let mut inner = d.lock();
+            let inner = d.lock().await;
             let w = watch.lock().unwrap().clone();
             let stale_screen = |inner: &Inner| match &w.id {
                 Some(id) => inner
@@ -1280,7 +1321,12 @@ fn subscribe(d: &Shared, reader: BufReader<UnixStream>, mut writer: UnixStream) 
                 None => false,
             };
             if inner.version == sent_version && !stale_screen(&inner) {
-                inner = d.changed.wait_timeout(inner, Duration::from_secs(2)).unwrap_or_else(|e| e.into_inner()).0;
+                // Nothing to send yet: wait until a session changes, or two
+                // seconds pass (so a vanished client is noticed).
+                let _ = version_rx.borrow_and_update();
+                drop(inner);
+                let _ = tokio::time::timeout(Duration::from_secs(2), version_rx.changed()).await;
+                continue;
             }
             let sessions = (inner.version != sent_version).then(|| {
                 sent_version = inner.version;
@@ -1295,28 +1341,34 @@ fn subscribe(d: &Shared, reader: BufReader<UnixStream>, mut writer: UnixStream) 
             (sessions, job)
         };
         if let Some(sessions) = sessions {
-            write_line(&mut writer, &StreamEvent::Sessions { sessions })?;
+            write_line(&mut writer, &StreamEvent::Sessions { sessions }).await?;
         }
         if let Some(((id, generation), term)) = screen_job {
             watch.lock().unwrap().dirty = false;
-            let screen = term.and_then(|t| t.snapshot()).unwrap_or_default();
-            write_line(&mut writer, &StreamEvent::Screen { id: id.clone(), screen })?;
+            let screen = match term {
+                Some(term) => term.snapshot().await.unwrap_or_default(),
+                None => Default::default(),
+            };
+            write_line(&mut writer, &StreamEvent::Screen { id: id.clone(), screen }).await?;
             sent_screen = Some((id, generation));
             // Cap the frame rate; output arriving meanwhile is coalesced.
             if let Some(rest) = frame.checked_sub(started.elapsed()) {
-                std::thread::sleep(rest);
+                tokio::time::sleep(rest).await;
             }
         }
     }
     Ok(())
 }
 
-fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
-    let term_of = |id: &str| d.lock().sessions.get(id).and_then(|s| s.term.clone());
+async fn term_of(d: &Shared, id: &str) -> Option<TermHandle> {
+    d.lock().await.sessions.get(id).and_then(|s| s.term.clone())
+}
+
+async fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
     match ev {
         ClientEvent::Watch { id, cols, rows } => {
             if let Some(id) = &id {
-                let mut inner = d.lock();
+                let mut inner = d.lock().await;
                 if let Some(s) = inner.sessions.get_mut(id)
                     && cols > 0 && rows > 0 && s.size != (cols, rows) {
                         s.size = (cols, rows);
@@ -1331,25 +1383,26 @@ fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
             let mut w = watch.lock().unwrap();
             w.id = id;
             w.dirty = true;
-            d.changed.notify_all();
+            drop(w);
+            d.poke_watchers();
         }
         ClientEvent::Key { id, key } => {
-            if let Some(t) = input_term(d, &id, || WakeInput::Key(key.clone())) {
+            if let Some(t) = input_term(d, &id, || WakeInput::Key(key.clone())).await {
                 t.key(key);
             }
         }
         ClientEvent::Paste { id, text } => {
-            if let Some(t) = input_term(d, &id, || WakeInput::Paste(text.clone())) {
+            if let Some(t) = input_term(d, &id, || WakeInput::Paste(text.clone())).await {
                 t.paste(text);
             }
         }
         ClientEvent::Scroll { id, delta, col, row } => {
-            if let Some(t) = term_of(&id) {
+            if let Some(t) = term_of(d, &id).await {
                 t.scroll(delta, col, row);
             }
         }
         ClientEvent::ScrollReset { id } => {
-            if let Some(t) = term_of(&id) {
+            if let Some(t) = term_of(d, &id).await {
                 t.scroll_reset();
             }
         }
@@ -1358,8 +1411,8 @@ fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
 
 /// The terminal to type into, or None after buffering the input and waking
 /// the session if it is asleep. Typing keeps a session awake.
-fn input_term(d: &Shared, id: &str, input: impl FnOnce() -> WakeInput) -> Option<TermHandle> {
-    let mut inner = d.lock();
+async fn input_term(d: &Shared, id: &str, input: impl FnOnce() -> WakeInput) -> Option<TermHandle> {
+    let mut inner = d.lock().await;
     let s = inner.sessions.get_mut(id)?;
     s.idle_since = None;
     s.draft_at = Some(Instant::now());
@@ -1368,10 +1421,10 @@ fn input_term(d: &Shared, id: &str, input: impl FnOnce() -> WakeInput) -> Option
     }
     s.wake_input.push(input());
     if s.info.asleep {
-        if let Err(e) = wake(d, s) {
+        if let Err(e) = wake(d, s).await {
             eprintln!("[{}] failed to wake {id}: {e:#}", paths::now());
         }
-        d.touch(&mut inner);
+        d.touch(&mut inner).await;
     }
     None
 }

@@ -2,18 +2,18 @@
 //! selected session's terminal (rendered from the daemon's emulator
 //! state). Focus the terminal to type into claude directly.
 
-use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures_util::StreamExt;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode as CtKey, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode as CtKey, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color as TColor, Modifier, Style, Stylize};
@@ -139,8 +139,9 @@ struct App {
     focus: Focus,
     modal: Option<Modal>,
     flash: Option<(String, bool, Instant)>,
-    tx: Sender<AppMsg>,
-    stream: UnixStream,
+    tx: UnboundedSender<AppMsg>,
+    /// Client events for the daemon, written by a dedicated task.
+    events: UnboundedSender<Vec<u8>>,
     /// What the daemon was last told to watch.
     watching: Option<(Option<String>, u16, u16)>,
     pane: Rect,
@@ -150,33 +151,36 @@ struct App {
     connected: bool,
 }
 
-pub fn run(initial: Option<String>, attach: bool) -> Result<()> {
-    let mut conn = client::connect()?;
-    conn.send(&Request::Subscribe)?;
-    let stream = conn.writer()?;
-    let mut reader = conn.into_reader();
+pub async fn run(initial: Option<String>, attach: bool) -> Result<()> {
+    let mut conn = client::connect().await?;
+    conn.send(&Request::Subscribe).await?;
+    let (reader, writer) = conn.into_split();
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line)
-                            && tx.send(AppMsg::Stream(ev)).is_err() {
-                                return;
-                            }
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line)
+                    && tx.send(AppMsg::Stream(ev)).is_err() {
+                        return;
                     }
-                }
             }
             let _ = tx.send(AppMsg::Disconnected);
         });
     }
+    // Client events go through a channel so input handling never blocks.
+    let (events, mut event_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(bytes) = event_rx.recv().await {
+            if writer.write_all(&bytes).await.is_err() {
+                break;
+            }
+            let _ = writer.flush().await;
+        }
+    });
 
     let mut app = App {
         sessions: Vec::new(),
@@ -186,7 +190,7 @@ pub fn run(initial: Option<String>, attach: bool) -> Result<()> {
         modal: None,
         flash: None,
         tx,
-        stream,
+        events,
         watching: None,
         pane: Rect::default(),
         sidebar: Rect::default(),
@@ -205,7 +209,7 @@ pub fn run(initial: Option<String>, attach: bool) -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
-    let result = app.event_loop(&mut term, rx);
+    let result = app.event_loop(&mut term, rx).await;
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
@@ -215,33 +219,38 @@ pub fn run(initial: Option<String>, attach: bool) -> Result<()> {
 }
 
 impl App {
-    fn event_loop(&mut self, term: &mut DefaultTerminal, rx: Receiver<AppMsg>) -> Result<()> {
+    async fn event_loop(&mut self, term: &mut DefaultTerminal, mut rx: UnboundedReceiver<AppMsg>) -> Result<()> {
         let mut last_draw = Instant::now() - Duration::from_secs(1);
         let mut dirty = true;
+        let mut input = EventStream::new();
+        // Keeps spinners and relative times moving between events.
+        let mut tick = tokio::time::interval(Duration::from_millis(25));
         while !self.quit {
-            while let Ok(msg) = rx.try_recv() {
-                self.on_msg(msg);
-                dirty = true;
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => self.on_msg(msg),
+                        None => self.quit = true,
+                    }
+                    dirty = true;
+                }
+                event = input.next() => {
+                    if let Some(Ok(ev)) = event {
+                        self.on_event(ev);
+                    }
+                    dirty = true;
+                }
+                _ = tick.tick() => {
+                    if last_draw.elapsed() >= Duration::from_millis(100) {
+                        dirty = true;
+                    }
+                }
             }
-            // Keep spinners and relative times moving.
-            if last_draw.elapsed() >= Duration::from_millis(100) {
-                dirty = true;
-            }
-            if dirty {
+            if dirty && !self.quit {
                 term.draw(|f| self.draw(f))?;
                 self.sync_watch();
                 last_draw = Instant::now();
                 dirty = false;
-            }
-            if event::poll(Duration::from_millis(16))? {
-                loop {
-                    let ev = event::read()?;
-                    self.on_event(ev);
-                    if self.quit || !event::poll(Duration::ZERO)? {
-                        break;
-                    }
-                }
-                dirty = true;
             }
         }
         Ok(())
@@ -291,7 +300,7 @@ impl App {
     fn send_event(&mut self, ev: &ClientEvent) {
         let Ok(mut line) = serde_json::to_vec(ev) else { return };
         line.push(b'\n');
-        let _ = self.stream.write_all(&line);
+        let _ = self.events.send(line);
     }
 
     /// Tell the daemon which session we show and at what size.
@@ -328,8 +337,8 @@ impl App {
     fn command(&self, req: Request, ok_text: impl Into<String>, select_created: bool) {
         let tx = self.tx.clone();
         let ok_text = ok_text.into();
-        std::thread::spawn(move || {
-            let msg = match client::request(&req) {
+        tokio::spawn(async move {
+            let msg = match client::request(&req).await {
                 Ok(Response::Session { session }) if select_created => {
                     let _ = tx.send(AppMsg::Select(session.id.clone()));
                     AppMsg::Flash(format!("{ok_text} {}", session.short_id()), false)

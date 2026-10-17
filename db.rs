@@ -37,12 +37,6 @@ const SESSION_COLUMNS: &str = "id, description, cwd, prompt, status, status_deta
     created_at, updated_at, exit_code, turns, last_message, \
     claude_args, auto_trust, background, asleep, continued_as";
 
-/// The async Turso API driven synchronously: local file IO completes inline,
-/// so there is no reactor to run.
-fn block_on<F: Future>(f: F) -> F::Output {
-    pollster::block_on(f)
-}
-
 pub struct Db {
     conn: turso::Connection,
     _db: turso::Database,
@@ -51,19 +45,20 @@ pub struct Db {
 impl Db {
     /// Open (creating if needed) the database at `path` and apply any
     /// pending migrations.
-    pub fn open(path: &Path) -> Result<Db> {
+    pub async fn open(path: &Path) -> Result<Db> {
         let path_str = path.to_str().ok_or_else(|| anyhow!("non-UTF-8 database path {}", path.display()))?;
-        let db = block_on(turso::Builder::new_local(path_str).build())
+        let db = turso::Builder::new_local(path_str)
+            .build()
+            .await
             .with_context(|| format!("open {}", path.display()))?;
         let conn = db.connect()?;
         let db = Db { conn, _db: db };
-        db.migrate().context("apply database migrations")?;
+        db.migrate().await.context("apply database migrations")?;
         Ok(db)
     }
 
-    fn migrate(&self) -> Result<()> {
-        block_on(async {
-            self.conn
+    async fn migrate(&self) -> Result<()> {
+        self.conn
                 .execute(
                     "CREATE TABLE IF NOT EXISTS _applied_migrations (
                         name TEXT PRIMARY KEY NOT NULL,
@@ -103,12 +98,10 @@ impl Db {
                 eprintln!("[{}] applied migration {name}", paths::now());
             }
             Ok(())
-        })
     }
 
-    pub fn load_sessions(&self) -> Result<Vec<SessionInfo>> {
-        block_on(async {
-            let mut rows = self
+    pub async fn load_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let mut rows = self
                 .conn
                 .query(format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY id"), ())
                 .await?;
@@ -119,18 +112,16 @@ impl Db {
                 infos.push(info);
             }
             Ok(infos)
-        })
     }
 
     /// Replace the stored sessions with `infos`, atomically.
-    pub fn save_sessions<'a>(&self, infos: impl IntoIterator<Item = &'a SessionInfo>) -> Result<()> {
+    pub async fn save_sessions<'a>(&self, infos: impl IntoIterator<Item = &'a SessionInfo>) -> Result<()> {
         let insert = format!(
             "INSERT INTO sessions ({SESSION_COLUMNS}) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         );
         let rows = infos.into_iter().map(session_params).collect::<Result<Vec<_>>>()?;
-        block_on(async {
-            self.conn.execute("BEGIN", ()).await?;
+        self.conn.execute("BEGIN", ()).await?;
             let result = async {
                 self.conn.execute("DELETE FROM sessions", ()).await?;
                 for params in rows {
@@ -144,7 +135,6 @@ impl Db {
                 let _ = self.conn.execute("ROLLBACK", ()).await;
             }
             result
-        })
     }
 }
 
@@ -246,17 +236,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn migrates_once_and_round_trips_sessions() {
+    #[tokio::test]
+    async fn migrates_once_and_round_trips_sessions() {
         let path = temp_db_path("roundtrip");
         {
-            let db = Db::open(&path).unwrap();
-            db.save_sessions(&[sample("a1"), sample("b2")]).unwrap();
-            db.save_sessions(&[sample("b2")]).unwrap();
+            let db = Db::open(&path).await.unwrap();
+            db.save_sessions(&[sample("a1"), sample("b2")]).await.unwrap();
+            db.save_sessions(&[sample("b2")]).await.unwrap();
         }
         // Reopening must not re-run migrations (CREATE TABLE would fail).
-        let db = Db::open(&path).unwrap();
-        let infos = db.load_sessions().unwrap();
+        let db = Db::open(&path).await.unwrap();
+        let infos = db.load_sessions().await.unwrap();
         assert_eq!(infos.len(), 1);
         let s = &infos[0];
         assert_eq!(s.id, "b2");
