@@ -1,0 +1,44 @@
+# Project config for mise. Docs: https://mise.jdx.dev/configuration.html
+# Tools are pinned to exact versions so everyone builds with the same
+# toolchain. Bump them here, then run `mise lock` and commit mise.lock.
+
+[tools]
+rust = "1.99.1"
+python = "3.15.0"
+
+[tasks.build]
+description = "Build the debug binary"
+run = "cargo build"
+
+[tasks.test]
+description = "Run all cargo tests"
+run = "cargo test"
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt"
+
+[tasks.fmt-check]
+description = "Verify formatting"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Clippy with warnings as errors"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.e2e]
+description = "Run the e2e tests against real Claude Code"
+run = "python3 e2e/questions.py"
+
+[tasks.check]
+description = "Static checks and tests (no e2e)"
+depends = ["fmt-check", "lint", "test"]
+
+[tasks.check-full]
+description = "Static checks, tests, and e2e tests (needs Claude Code auth)"
+depends = ["fmt-check", "lint", "test", "e2e"]
+
+[tasks.release]
+description = "Cut a release (pass a version: patch | minor | major | x.y.z)"
+confirm = "Cut a new release?"
+file = "release.sh"
