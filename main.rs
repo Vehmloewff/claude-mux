@@ -1,12 +1,14 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use claude_mux::paths;
-use claude_mux::protocol::{self, CreateRequest, KeyInput, Request, Response, SessionInfo, Status, short_id};
+use claude_mux::protocol::{
+    self, CreateRequest, KeyInput, Request, Response, SessionInfo, Status, short_id,
+};
 use claude_mux::term::{Dialog, parse_dialog};
 use claude_mux::{ago, client, hooks, manage, short_path, upgrade};
 
@@ -426,10 +428,17 @@ async fn main() -> ExitCode {
         Err(e) => {
             let _ = e.print();
             // Usage errors get their own code, apart from `wait`'s 2 (needs input).
-            return if e.use_stderr() { ExitCode::from(64) } else { ExitCode::SUCCESS };
+            return if e.use_stderr() {
+                ExitCode::from(64)
+            } else {
+                ExitCode::SUCCESS
+            };
         }
     };
-    if !matches!(&cli.command, Command::Hook { .. } | Command::Daemon | Command::Upgrade { .. }) {
+    if !matches!(
+        &cli.command,
+        Command::Hook { .. } | Command::Daemon | Command::Upgrade { .. }
+    ) {
         upgrade::notify_if_update_available().await;
     }
     match run(cli.command).await {
@@ -444,7 +453,10 @@ async fn main() -> ExitCode {
 async fn read_arg(value: String) -> Result<String> {
     if value == "-" {
         let mut buf = String::new();
-        tokio::io::stdin().read_to_string(&mut buf).await.context("reading stdin")?;
+        tokio::io::stdin()
+            .read_to_string(&mut buf)
+            .await
+            .context("reading stdin")?;
         Ok(buf)
     } else {
         Ok(value)
@@ -453,7 +465,12 @@ async fn read_arg(value: String) -> Result<String> {
 
 /// The session `-s` names, or the one picked from those `offer` includes.
 async fn pick(session: One, offer: Offer, prompt: &str) -> Result<String> {
-    select::one(&list_sessions().await?, session.session.as_deref(), offer, prompt)
+    select::one(
+        &list_sessions().await?,
+        session.session.as_deref(),
+        offer,
+        prompt,
+    )
 }
 
 async fn get_session(id: &str) -> Result<SessionInfo> {
@@ -489,7 +506,8 @@ async fn run(command: Command) -> Result<ExitCode> {
                 None => String::new(),
             };
             let cwd = match cwd {
-                Some(dir) => std::fs::canonicalize(&dir).map_err(|_| anyhow::anyhow!("no such directory: {dir}"))?,
+                Some(dir) => std::fs::canonicalize(&dir)
+                    .map_err(|_| anyhow::anyhow!("no such directory: {dir}"))?,
                 None => std::env::current_dir()?,
             };
             let mut claude_args = Vec::new();
@@ -510,7 +528,9 @@ async fn run(command: Command) -> Result<ExitCode> {
                 claude_args,
                 trust,
             });
-            let Response::Session { session } = client::request(&req).await? else { bail!("unexpected response") };
+            let Response::Session { session } = client::request(&req).await? else {
+                bail!("unexpected response")
+            };
             if wait {
                 eprintln!("{}", session.id);
                 return wait_cmd(vec![session.id], false, timeout, false, false, false).await;
@@ -518,25 +538,53 @@ async fn run(command: Command) -> Result<ExitCode> {
             println!("{}", session.id);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Send { message, session, now, wait, timeout } => {
+        Command::Send {
+            message,
+            session,
+            now,
+            wait,
+            timeout,
+        } => {
             let message = read_arg(message).await?;
             if message.trim().is_empty() {
                 bail!("message is empty");
             }
             let id = pick(session, Offer::Running, "Send to which session?").await?;
-            client::request(&Request::Send { id: id.clone(), message, now }).await?;
+            client::request(&Request::Send {
+                id: id.clone(),
+                message,
+                now,
+            })
+            .await?;
             if wait {
                 return wait_cmd(vec![id], false, timeout, false, false, false).await;
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Wait { sessions, any, timeout, turn, quiet, json } => {
-            let ids = select::many(&list_sessions().await?, &sessions.sessions, Offer::Running, "Wait for which sessions?")?;
+        Command::Wait {
+            sessions,
+            any,
+            timeout,
+            turn,
+            quiet,
+            json,
+        } => {
+            let ids = select::many(
+                &list_sessions().await?,
+                &sessions.sessions,
+                Offer::Running,
+                "Wait for which sessions?",
+            )?;
             wait_cmd(ids, any, timeout, turn, quiet, json).await
         }
         Command::Manage { session } => {
             let id = match session {
-                Some(q) => Some(select::one(&list_sessions().await?, Some(&q), Offer::All, "Select which session?")?),
+                Some(q) => Some(select::one(
+                    &list_sessions().await?,
+                    Some(&q),
+                    Offer::All,
+                    "Select which session?",
+                )?),
                 None => None,
             };
             manage::run(id, false).await.map(|_| ExitCode::SUCCESS)
@@ -569,7 +617,8 @@ async fn run(command: Command) -> Result<ExitCode> {
         }
         Command::Peek { session, ansi } => {
             let id = pick(session, Offer::Running, "Peek at which session?").await?;
-            let Response::Text { text } = client::request(&Request::Peek { id, ansi }).await? else {
+            let Response::Text { text } = client::request(&Request::Peek { id, ansi }).await?
+            else {
                 bail!("unexpected response")
             };
             print!("{text}");
@@ -578,7 +627,11 @@ async fn run(command: Command) -> Result<ExitCode> {
         Command::Keys { keys, session } => {
             let keys = keys
                 .iter()
-                .map(|k| protocol::KeyInput::parse(k).with_context(|| format!("unknown key '{k}' (see `claude-mux keys --help`)")))
+                .map(|k| {
+                    protocol::KeyInput::parse(k).with_context(|| {
+                        format!("unknown key '{k}' (see `claude-mux keys --help`)")
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?;
             let id = pick(session, Offer::Running, "Press keys in which session?").await?;
             client::request(&Request::Keys { id, keys }).await?;
@@ -604,12 +657,21 @@ async fn run(command: Command) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Rm { sessions } => {
-            for id in select::many(&list_sessions().await?, &sessions.sessions, Offer::All, "Remove which sessions?")? {
+            for id in select::many(
+                &list_sessions().await?,
+                &sessions.sessions,
+                Offer::All,
+                "Remove which sessions?",
+            )? {
                 client::request(&Request::Remove { id }).await?;
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Describe { description, clear, session } => {
+        Command::Describe {
+            description,
+            clear,
+            session,
+        } => {
             let id = pick(session, Offer::All, "Describe which session?").await?;
             let description = if clear { None } else { description };
             client::request(&Request::Describe { id, description }).await?;
@@ -623,11 +685,18 @@ async fn run(command: Command) -> Result<ExitCode> {
         }
         Command::Daemon => {
             if let claude_mux::daemon::Started::AlreadyRunning = claude_mux::daemon::run().await? {
-                eprintln!("claude-mux: daemon already running for {}", paths::home().display());
+                eprintln!(
+                    "claude-mux: daemon already running for {}",
+                    paths::home().display()
+                );
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Upgrade { version, force, yes } => upgrade_cmd(version, force, yes).await,
+        Command::Upgrade {
+            version,
+            force,
+            yes,
+        } => upgrade_cmd(version, force, yes).await,
         Command::Hook { event } => {
             hooks::run_hook(&event).await;
             Ok(ExitCode::SUCCESS)
@@ -656,12 +725,17 @@ async fn upgrade_cmd(version: Option<String>, force: bool, yes: bool) -> Result<
             },
             None => None,
         };
-        let running: Option<Vec<SessionInfo>> =
-            sessions.map(|s| s.into_iter().filter(|s| s.status.is_live() && !s.asleep).collect());
+        let running: Option<Vec<SessionInfo>> = sessions.map(|s| {
+            s.into_iter()
+                .filter(|s| s.status.is_live() && !s.asleep)
+                .collect()
+        });
         let ask = match &running {
             Some(running) if running.is_empty() => false,
             Some(running) => {
-                eprintln!("These sessions are running and will be stopped when the daemon restarts:\n");
+                eprintln!(
+                    "These sessions are running and will be stopped when the daemon restarts:\n"
+                );
                 print_table(running);
                 eprintln!("\nResume them afterwards with `claude-mux resume <id>`.");
                 true
@@ -699,16 +773,40 @@ async fn confirm(question: &str) -> Result<bool> {
     eprint!("{question} [y/N] ");
     std::io::stderr().flush()?;
     let mut answer = String::new();
-    BufReader::new(tokio::io::stdin()).read_line(&mut answer).await?;
+    BufReader::new(tokio::io::stdin())
+        .read_line(&mut answer)
+        .await?;
     Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
-async fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool, quiet: bool, json: bool) -> Result<ExitCode> {
+async fn wait_cmd(
+    ids: Vec<String>,
+    any: bool,
+    timeout: Option<u64>,
+    turn: bool,
+    quiet: bool,
+    json: bool,
+) -> Result<ExitCode> {
     let timeout_ms = timeout
-        .map(|seconds| seconds.checked_mul(1000).ok_or_else(|| anyhow::anyhow!("timeout is too large")))
+        .map(|seconds| {
+            seconds
+                .checked_mul(1000)
+                .ok_or_else(|| anyhow::anyhow!("timeout is too large"))
+        })
         .transpose()?;
-    let req = Request::Wait { ids, any, timeout_ms, turn };
-    let Response::Wait { sessions, timed_out } = client::request(&req).await? else { bail!("unexpected response") };
+    let req = Request::Wait {
+        ids,
+        any,
+        timeout_ms,
+        turn,
+    };
+    let Response::Wait {
+        sessions,
+        timed_out,
+    } = client::request(&req).await?
+    else {
+        bail!("unexpected response")
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else {
@@ -716,16 +814,22 @@ async fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool,
         for s in &sessions {
             let status = s.effective_status();
             if multi || status != Status::Idle {
-                let detail = s.status_detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+                let detail = s
+                    .status_detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default();
                 eprintln!("{}: {}{}", s.short_id(), status.label(), detail);
             }
-            if !quiet && status.is_turn_over()
-                && let Some(m) = &s.last_message {
-                    if multi {
-                        println!("--- {} ---", s.short_id());
-                    }
-                    println!("{m}");
+            if !quiet
+                && status.is_turn_over()
+                && let Some(m) = &s.last_message
+            {
+                if multi {
+                    println!("--- {} ---", s.short_id());
                 }
+                println!("{m}");
+            }
         }
     }
     if timed_out {
@@ -733,15 +837,20 @@ async fn wait_cmd(ids: Vec<String>, any: bool, timeout: Option<u64>, turn: bool,
         return Ok(ExitCode::from(124));
     }
     let statuses: Vec<Status> = sessions.iter().map(|s| s.effective_status()).collect();
-    Ok(if statuses.iter().any(|s| matches!(s, Status::NeedsInput)) {
-        ExitCode::from(2)
-    } else if statuses.iter().any(|s| matches!(s, Status::Exited | Status::Stopped)) {
-        ExitCode::from(3)
-    } else if statuses.contains(&Status::Background) {
-        ExitCode::from(4)
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(
+        if statuses.iter().any(|s| matches!(s, Status::NeedsInput)) {
+            ExitCode::from(2)
+        } else if statuses
+            .iter()
+            .any(|s| matches!(s, Status::Exited | Status::Stopped))
+        {
+            ExitCode::from(3)
+        } else if statuses.contains(&Status::Background) {
+            ExitCode::from(4)
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -749,7 +858,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -759,11 +871,18 @@ fn counts_as_waiting(session: &SessionInfo, ask: bool) -> bool {
 
 /// Longest-waiting first.
 fn order_waiting(sessions: &mut [SessionInfo]) {
-    sessions.sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then_with(|| a.id.cmp(&b.id)));
+    sessions.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn print_table(sessions: &[SessionInfo]) {
-    println!("{:<8}  {:<12} {:>5}  {:<40} CWD", "ID", "STATUS", "AGE", "DESCRIPTION");
+    println!(
+        "{:<8}  {:<12} {:>5}  {:<40} CWD",
+        "ID", "STATUS", "AGE", "DESCRIPTION"
+    );
     for s in sessions {
         println!(
             "{:<8}  {:<12} {:>5}  {:<40} {}",
@@ -805,7 +924,12 @@ fn is_false(v: &bool) -> bool {
 }
 
 async fn peek_plain(id: &str) -> Option<String> {
-    match client::request(&Request::Peek { id: id.to_string(), ansi: false }).await {
+    match client::request(&Request::Peek {
+        id: id.to_string(),
+        ansi: false,
+    })
+    .await
+    {
         Ok(Response::Text { text }) => Some(text),
         _ => None,
     }
@@ -831,10 +955,19 @@ fn ask_from_screen(dialog: Dialog) -> hooks::Ask {
     }
 }
 
-async fn questions_cmd(cmd: Option<QuestionsCmd>, session: Option<String>, json: bool) -> Result<ExitCode> {
+async fn questions_cmd(
+    cmd: Option<QuestionsCmd>,
+    session: Option<String>,
+    json: bool,
+) -> Result<ExitCode> {
     let mut sessions = list_sessions().await?;
     if let Some(query) = session {
-        let id = select::one(&sessions, Some(&query), Offer::All, "Questions from which session?")?;
+        let id = select::one(
+            &sessions,
+            Some(&query),
+            Offer::All,
+            "Questions from which session?",
+        )?;
         sessions.retain(|s| s.id == id);
     }
     let mut rows = waiting_rows(sessions).await;
@@ -850,7 +983,11 @@ async fn questions_cmd(cmd: Option<QuestionsCmd>, session: Option<String>, json:
                 print_waiting(&rows);
             }
         }
-        Some(QuestionsCmd::Answer { question, selection, notes }) => {
+        Some(QuestionsCmd::Answer {
+            question,
+            selection,
+            notes,
+        }) => {
             record_answer(&mut store, &rows, &question, &selection, notes).await?;
         }
         Some(QuestionsCmd::Chat { message }) => {
@@ -863,12 +1000,18 @@ async fn questions_cmd(cmd: Option<QuestionsCmd>, session: Option<String>, json:
 }
 
 fn question_name(q: &hooks::AskQuestion) -> &str {
-    q.header.as_deref().filter(|h| !h.is_empty()).unwrap_or(&q.question)
+    q.header
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .unwrap_or(&q.question)
 }
 
 fn question_matches(q: &hooks::AskQuestion, query: &str) -> bool {
     let query = query.trim();
-    q.header.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(query)) || q.question.eq_ignore_ascii_case(query)
+    q.header
+        .as_deref()
+        .is_some_and(|h| h.eq_ignore_ascii_case(query))
+        || q.question.eq_ignore_ascii_case(query)
 }
 
 fn dialog_key(ask: &hooks::Ask) -> String {
@@ -889,7 +1032,9 @@ fn parse_selection(spec: &str) -> Result<Vec<usize>> {
         if part.is_empty() {
             bail!("`{spec}` has an empty choice");
         }
-        let n: usize = part.parse().with_context(|| format!("`{part}` is not an option number"))?;
+        let n: usize = part
+            .parse()
+            .with_context(|| format!("`{part}` is not an option number"))?;
         if n == 0 {
             bail!("option numbers start at 1");
         }
@@ -917,7 +1062,12 @@ fn find_question<'a>(rows: &'a [WaitingRow], query: &str) -> Result<Found<'a>> {
         let Some(ask) = &row.dialog else { continue };
         for (index, question) in ask.questions.iter().enumerate() {
             if question_matches(question, query) {
-                hits.push(Found { session_id: &row.session.id, ask, index, screen: row.screen });
+                hits.push(Found {
+                    session_id: &row.session.id,
+                    ask,
+                    index,
+                    screen: row.screen,
+                });
             }
         }
     }
@@ -928,31 +1078,62 @@ fn find_question<'a>(rows: &'a [WaitingRow], query: &str) -> Result<Found<'a>> {
             for row in rows {
                 let Some(ask) = &row.dialog else { continue };
                 for question in &ask.questions {
-                    names.push(format!("{}  {}", row.session.short_id(), question_name(question)));
+                    names.push(format!(
+                        "{}  {}",
+                        row.session.short_id(),
+                        question_name(question)
+                    ));
                 }
             }
             if names.is_empty() {
                 bail!("no question named `{query}` is waiting");
             }
-            bail!("no question named `{query}` is waiting\n{}", names.join("\n"));
+            bail!(
+                "no question named `{query}` is waiting\n{}",
+                names.join("\n")
+            );
         }
         _ => {
-            let lines: Vec<String> = hits.iter().map(|h| format!("{}  {}", short_id(h.session_id), question_name(&h.ask.questions[h.index]))).collect();
-            bail!("`{query}` matches more than one question\n{}", lines.join("\n"));
+            let lines: Vec<String> = hits
+                .iter()
+                .map(|h| {
+                    format!(
+                        "{}  {}",
+                        short_id(h.session_id),
+                        question_name(&h.ask.questions[h.index])
+                    )
+                })
+                .collect();
+            bail!(
+                "`{query}` matches more than one question\n{}",
+                lines.join("\n")
+            );
         }
     }
 }
 
-async fn record_answer(store: &mut AnswerStore, rows: &[WaitingRow], query: &str, selection: &str, notes: Option<String>) -> Result<()> {
+async fn record_answer(
+    store: &mut AnswerStore,
+    rows: &[WaitingRow],
+    query: &str,
+    selection: &str,
+    notes: Option<String>,
+) -> Result<()> {
     let found = find_question(rows, query)?;
     let question = &found.ask.questions[found.index];
     let options = parse_selection(selection)?;
-    if let Some(n) = options.iter().find(|n| **n > question.options.len() || !question.multi_select && **n > 9) {
+    if let Some(n) = options
+        .iter()
+        .find(|n| **n > question.options.len() || !question.multi_select && **n > 9)
+    {
         bail!("option {n} is not on `{}`", question_name(question));
     }
     if question.multi_select {
         if notes.as_ref().is_some_and(|n| !n.is_empty()) {
-            bail!("`{}` is a checkbox and takes no notes", question_name(question));
+            bail!(
+                "`{}` is a checkbox and takes no notes",
+                question_name(question)
+            );
         }
     } else if options.len() != 1 {
         bail!("`{}` takes one option", question_name(question));
@@ -962,17 +1143,32 @@ async fn record_answer(store: &mut AnswerStore, rows: &[WaitingRow], query: &str
     }
     let notes = notes.filter(|n| !n.is_empty());
     let key = dialog_key(found.ask);
-    let staged = store.sessions.entry(found.session_id.to_string()).or_default();
+    let staged = store
+        .sessions
+        .entry(found.session_id.to_string())
+        .or_default();
     if staged.dialog != key {
         staged.dialog = key;
         staged.answers.clear();
     }
     staged.answers.retain(|a| a.index != found.index);
-    staged.answers.push(StagedPick { index: found.index, options: options.clone(), notes: notes.clone() });
+    staged.answers.push(StagedPick {
+        index: found.index,
+        options: options.clone(),
+        notes: notes.clone(),
+    });
     staged.answers.sort_by_key(|a| a.index);
     save_answers(store).await?;
-    let nums = options.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-    println!("{}  {}  {nums}", short_id(found.session_id), question_name(question));
+    let nums = options
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "{}  {}  {nums}",
+        short_id(found.session_id),
+        question_name(question)
+    );
     if let Some(notes) = &notes {
         println!("  notes: {notes}");
     }
@@ -996,7 +1192,10 @@ fn sole_dialog(rows: &[WaitingRow]) -> Result<&WaitingRow> {
         1 => Ok(dialogs[0]),
         0 => bail!("nothing is waiting"),
         _ => {
-            let lines: Vec<String> = dialogs.iter().map(|r| format!("{}  {}", r.session.short_id(), r.session.display_name())).collect();
+            let lines: Vec<String> = dialogs
+                .iter()
+                .map(|r| format!("{}  {}", r.session.short_id(), r.session.display_name()))
+                .collect();
             bail!("more than one session is waiting\n{}", lines.join("\n"));
         }
     }
@@ -1011,10 +1210,19 @@ async fn chat_about(store: &mut AnswerStore, rows: &[WaitingRow], message: &str)
     if row.screen {
         bail!("a permission prompt has no Chat about this");
     }
-    let question = row.dialog.as_ref().and_then(|ask| ask.questions.first()).context("no question is waiting")?;
+    let question = row
+        .dialog
+        .as_ref()
+        .and_then(|ask| ask.questions.first())
+        .context("no question is waiting")?;
     let n = chat_option(question)?;
     press(&row.session.id, &[n.to_string()]).await?;
-    client::request(&Request::Send { id: row.session.id.clone(), message: message.to_string(), now: false }).await?;
+    client::request(&Request::Send {
+        id: row.session.id.clone(),
+        message: message.to_string(),
+        now: false,
+    })
+    .await?;
     store.sessions.remove(&row.session.id);
     save_answers(store).await?;
     println!("{}  chat", row.session.short_id());
@@ -1026,14 +1234,18 @@ async fn submit_answers(store: &mut AnswerStore, rows: &[WaitingRow]) -> Result<
     for row in rows {
         let Some(ask) = &row.dialog else { continue };
         let picks = {
-            let Some(staged) = store.sessions.get(&row.session.id) else { continue };
+            let Some(staged) = store.sessions.get(&row.session.id) else {
+                continue;
+            };
             if staged.dialog != dialog_key(ask) || staged.answers.is_empty() {
                 continue;
             }
             staged.answers.clone()
         };
         let notes_ui = !row.screen
-            && peek_plain(&row.session.id).await.is_some_and(|s| s.to_ascii_lowercase().contains("add notes"));
+            && peek_plain(&row.session.id)
+                .await
+                .is_some_and(|s| s.to_ascii_lowercase().contains("add notes"));
         let steps = submit_steps(ask, &picks, row.screen, notes_ui)?;
         for step in &steps {
             press(&row.session.id, step).await?;
@@ -1044,7 +1256,9 @@ async fn submit_answers(store: &mut AnswerStore, rows: &[WaitingRow]) -> Result<
         submitted += 1;
     }
     if submitted == 0 {
-        bail!("nothing to submit; record choices with `claude-mux questions answer <question> <n>`");
+        bail!(
+            "nothing to submit; record choices with `claude-mux questions answer <question> <n>`"
+        );
     }
     Ok(())
 }
@@ -1054,7 +1268,11 @@ async fn press(id: &str, keys: &[String]) -> Result<()> {
     for key in keys {
         parsed.push(KeyInput::parse(key).with_context(|| format!("key `{key}`"))?);
     }
-    client::request(&Request::Keys { id: id.to_string(), keys: parsed }).await?;
+    client::request(&Request::Keys {
+        id: id.to_string(),
+        keys: parsed,
+    })
+    .await?;
     Ok(())
 }
 
@@ -1070,15 +1288,30 @@ async fn press(id: &str, keys: &[String]) -> Result<()> {
 /// whose screen says "add notes" focuses the option, types `n` and the note,
 /// leaves the field, then confirms. Anything that does not submit on its own
 /// stops on "Submit answers", which is option 1.
-fn submit_steps(ask: &hooks::Ask, picks: &[StagedPick], screen: bool, notes_ui: bool) -> Result<Vec<Vec<String>>> {
+fn submit_steps(
+    ask: &hooks::Ask,
+    picks: &[StagedPick],
+    screen: bool,
+    notes_ui: bool,
+) -> Result<Vec<Vec<String>>> {
     if picks.is_empty() {
         bail!("nothing to submit");
     }
     if screen {
-        let question = ask.questions.first().context("permission prompt has no question")?;
-        let pick = picks.iter().find(|p| p.index == 0).context("permission prompt has no recorded choice")?;
+        let question = ask
+            .questions
+            .first()
+            .context("permission prompt has no question")?;
+        let pick = picks
+            .iter()
+            .find(|p| p.index == 0)
+            .context("permission prompt has no recorded choice")?;
         let target = pick.options[0] - 1;
-        let selected = question.options.iter().position(|o| o.selected).unwrap_or(0);
+        let selected = question
+            .options
+            .iter()
+            .position(|o| o.selected)
+            .unwrap_or(0);
         let mut keys = Vec::new();
         let delta = target as isize - selected as isize;
         let motion = if delta > 0 { "down" } else { "up" };
@@ -1091,15 +1324,29 @@ fn submit_steps(ask: &hooks::Ask, picks: &[StagedPick], screen: bool, notes_ui: 
     let mut steps = Vec::new();
     for (index, question) in ask.questions.iter().enumerate() {
         let Some(pick) = picks.iter().find(|p| p.index == index) else {
-            steps.push(vec![if question.multi_select { "enter" } else { "tab" }.to_string()]);
+            steps.push(vec![
+                if question.multi_select {
+                    "enter"
+                } else {
+                    "tab"
+                }
+                .to_string(),
+            ]);
             continue;
         };
-        if let Some(n) = pick.options.iter().copied().find(|n| *n == 0 || *n > question.options.len() || !question.multi_select && *n > 9) {
+        if let Some(n) =
+            pick.options.iter().copied().find(|n| {
+                *n == 0 || *n > question.options.len() || !question.multi_select && *n > 9
+            })
+        {
             bail!("option {n} is not on `{}`", question_name(question));
         }
         if question.multi_select {
             if pick.notes.is_some() {
-                bail!("`{}` is a checkbox and takes no notes", question_name(question));
+                bail!(
+                    "`{}` is a checkbox and takes no notes",
+                    question_name(question)
+                );
             }
             let mut keys = Vec::new();
             for n in &pick.options {
@@ -1205,14 +1452,18 @@ async fn save_answers(store: &AnswerStore) -> Result<()> {
         tokio::fs::create_dir_all(dir).await?;
     }
     let text = serde_json::to_string_pretty(store)?;
-    tokio::fs::write(&path, text).await.with_context(|| format!("writing {}", path.display()))?;
+    tokio::fs::write(&path, text)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
 fn attach_recorded(rows: &mut [WaitingRow], store: &AnswerStore) {
     for row in rows {
         let Some(ask) = &row.dialog else { continue };
-        let Some(staged) = store.sessions.get(&row.session.id) else { continue };
+        let Some(staged) = store.sessions.get(&row.session.id) else {
+            continue;
+        };
         if staged.dialog != dialog_key(ask) {
             continue;
         }
@@ -1221,7 +1472,11 @@ fn attach_recorded(rows: &mut [WaitingRow], store: &AnswerStore) {
             .iter()
             .filter_map(|pick| {
                 let question = ask.questions.get(pick.index)?;
-                Some(Recorded { question: question_name(question).to_string(), options: pick.options.clone(), notes: pick.notes.clone() })
+                Some(Recorded {
+                    question: question_name(question).to_string(),
+                    options: pick.options.clone(),
+                    notes: pick.notes.clone(),
+                })
             })
             .collect();
     }
@@ -1244,10 +1499,19 @@ async fn waiting_rows(mut sessions: Vec<SessionInfo>) -> Vec<WaitingRow> {
             continue;
         }
         if ask.is_none() && session.effective_status() == Status::NeedsInput {
-            ask = peek_plain(&session.id).await.as_deref().and_then(parse_dialog).map(ask_from_screen);
+            ask = peek_plain(&session.id)
+                .await
+                .as_deref()
+                .and_then(parse_dialog)
+                .map(ask_from_screen);
             from_screen = ask.is_some();
         }
-        rows.push(WaitingRow { session, dialog: ask, screen: from_screen, recorded: Vec::new() });
+        rows.push(WaitingRow {
+            session,
+            dialog: ask,
+            screen: from_screen,
+            recorded: Vec::new(),
+        });
     }
     rows
 }
@@ -1294,8 +1558,17 @@ fn print_waiting(rows: &[WaitingRow]) {
                         }
                     }
                 }
-                if let Some(pick) = row.recorded.iter().find(|r| r.question == question_name(question)) {
-                    let nums = pick.options.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                if let Some(pick) = row
+                    .recorded
+                    .iter()
+                    .find(|r| r.question == question_name(question))
+                {
+                    let nums = pick
+                        .options
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
                     println!("    recorded: {nums}");
                     if let Some(notes) = &pick.notes {
                         println!("    notes: {notes}");
@@ -1322,9 +1595,17 @@ fn print_details(s: &SessionInfo) {
     if let Some(t) = &s.title {
         println!("title:       {t}");
     }
-    let detail = s.status_detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default();
+    let detail = s
+        .status_detail
+        .as_deref()
+        .map(|d| format!(" ({d})"))
+        .unwrap_or_default();
     let asleep = if s.asleep { " (asleep)" } else { "" };
-    println!("status:      {}{asleep}{}", s.effective_status().label(), detail);
+    println!(
+        "status:      {}{asleep}{}",
+        s.effective_status().label(),
+        detail
+    );
     println!("cwd:         {}", s.cwd);
     println!("created:     {} ago", ago(s.created_at));
     println!("turns:       {}", s.turns);
@@ -1382,7 +1663,10 @@ mod tests {
             session("plan", Status::Working, 4),
         ];
         let has_ask = |s: &SessionInfo| s.id == "plan";
-        let mut waiting: Vec<_> = sessions.into_iter().filter(|s| counts_as_waiting(s, has_ask(s))).collect();
+        let mut waiting: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| counts_as_waiting(s, has_ask(s)))
+            .collect();
         order_waiting(&mut waiting);
         let ids: Vec<_> = waiting.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["plan", "early", "later"]);
@@ -1398,11 +1682,20 @@ mod tests {
     }
 
     fn question(header: &str, multi: bool, options: Vec<hooks::AskOption>) -> hooks::AskQuestion {
-        hooks::AskQuestion { header: Some(header.into()), question: format!("q {header}"), multi_select: multi, options }
+        hooks::AskQuestion {
+            header: Some(header.into()),
+            question: format!("q {header}"),
+            multi_select: multi,
+            options,
+        }
     }
 
     fn pick(index: usize, options: Vec<usize>, notes: Option<&str>) -> StagedPick {
-        StagedPick { index, options, notes: notes.map(str::to_string) }
+        StagedPick {
+            index,
+            options,
+            notes: notes.map(str::to_string),
+        }
     }
 
     #[test]
@@ -1416,7 +1709,17 @@ mod tests {
 
     #[test]
     fn one_question_submits_on_its_number() {
-        let ask = hooks::Ask { questions: vec![question("State", false, vec![opt("a", false, false), opt("b", false, false), opt("c", false, false)])] };
+        let ask = hooks::Ask {
+            questions: vec![question(
+                "State",
+                false,
+                vec![
+                    opt("a", false, false),
+                    opt("b", false, false),
+                    opt("c", false, false),
+                ],
+            )],
+        };
         let steps = submit_steps(&ask, &[pick(0, vec![3], None)], false, false).unwrap();
         assert_eq!(steps, vec![vec!["3"]]);
     }
@@ -1425,51 +1728,112 @@ mod tests {
     fn several_questions_confirm_after_each_choice() {
         let ask = hooks::Ask {
             questions: vec![
-                question("State", false, vec![opt("a", false, false), opt("b", false, false)]),
-                question("Layout", false, vec![opt("a", false, false), opt("b", false, false)]),
+                question(
+                    "State",
+                    false,
+                    vec![opt("a", false, false), opt("b", false, false)],
+                ),
+                question(
+                    "Layout",
+                    false,
+                    vec![opt("a", false, false), opt("b", false, false)],
+                ),
             ],
         };
-        let steps = submit_steps(&ask, &[pick(0, vec![2], None), pick(1, vec![1], None)], false, false).unwrap();
+        let steps = submit_steps(
+            &ask,
+            &[pick(0, vec![2], None), pick(1, vec![1], None)],
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(steps, vec![vec!["2"], vec!["1"], vec!["1"]]);
     }
 
     #[test]
     fn checkbox_toggles_then_advances_and_confirms() {
-        let ask = hooks::Ask { questions: vec![question("Boxes", true, vec![opt("a", false, false), opt("b", false, false), opt("c", false, false)])] };
+        let ask = hooks::Ask {
+            questions: vec![question(
+                "Boxes",
+                true,
+                vec![
+                    opt("a", false, false),
+                    opt("b", false, false),
+                    opt("c", false, false),
+                ],
+            )],
+        };
         let steps = submit_steps(&ask, &[pick(0, vec![1, 2, 3], None)], false, false).unwrap();
         assert_eq!(
             steps,
-            vec![vec!["1", "2", "3", "down", "down", "down", "down", "enter"], vec!["1"]]
+            vec![
+                vec!["1", "2", "3", "down", "down", "down", "down", "enter"],
+                vec!["1"]
+            ]
         );
     }
 
     #[test]
     fn notes_are_typed_before_the_choice_is_confirmed() {
-        let ask = hooks::Ask { questions: vec![question("State", false, vec![opt("a", true, false), opt("b", true, false), opt("c", true, false)])] };
+        let ask = hooks::Ask {
+            questions: vec![question(
+                "State",
+                false,
+                vec![
+                    opt("a", true, false),
+                    opt("b", true, false),
+                    opt("c", true, false),
+                ],
+            )],
+        };
         let steps = submit_steps(&ask, &[pick(0, vec![3], Some("Hi there"))], false, true).unwrap();
         assert_eq!(
             steps,
-            vec![vec!["3", "n", "H", "i", "space", "t", "h", "e", "r", "e"], vec!["esc"], vec!["enter"]]
+            vec![
+                vec!["3", "n", "H", "i", "space", "t", "h", "e", "r", "e"],
+                vec!["esc"],
+                vec!["enter"]
+            ]
         );
     }
 
     #[test]
     fn notes_require_the_notes_field() {
-        let ask = hooks::Ask { questions: vec![question("State", false, vec![opt("a", false, false)])] };
+        let ask = hooks::Ask {
+            questions: vec![question("State", false, vec![opt("a", false, false)])],
+        };
         assert!(submit_steps(&ask, &[pick(0, vec![1], Some("Hi"))], false, false).is_err());
     }
 
     #[test]
     fn chat_about_this_is_the_option_after_other() {
-        let state = question("State", false, vec![opt("a", false, false), opt("b", false, false), opt("c", false, false)]);
+        let state = question(
+            "State",
+            false,
+            vec![
+                opt("a", false, false),
+                opt("b", false, false),
+                opt("c", false, false),
+            ],
+        );
         assert_eq!(chat_option(&state).unwrap(), 5);
-        let boxes = question("Boxes", true, vec![opt("a", false, false), opt("b", false, false)]);
+        let boxes = question(
+            "Boxes",
+            true,
+            vec![opt("a", false, false), opt("b", false, false)],
+        );
         assert_eq!(chat_option(&boxes).unwrap(), 4);
     }
 
     #[test]
     fn screen_prompt_moves_from_the_highlight() {
-        let ask = hooks::Ask { questions: vec![question("Trust", false, vec![opt("1. Yes", false, false), opt("2. No", false, true)])] };
+        let ask = hooks::Ask {
+            questions: vec![question(
+                "Trust",
+                false,
+                vec![opt("1. Yes", false, false), opt("2. No", false, true)],
+            )],
+        };
         let steps = submit_steps(&ask, &[pick(0, vec![1], None)], true, false).unwrap();
         assert_eq!(steps, vec![vec!["up", "enter"]]);
     }

@@ -41,27 +41,46 @@ pub fn matches<'a>(sessions: &'a [SessionInfo], query: &str) -> Vec<&'a SessionI
         return vec![s];
     }
     let query = query.to_ascii_lowercase();
-    sessions.iter().filter(|s| s.id.starts_with(&query)).collect()
+    sessions
+        .iter()
+        .filter(|s| s.id.starts_with(&query))
+        .collect()
 }
 
 /// The id of the session `query` names. Without a query, the only session
 /// `offer` includes. Asks which one when that leaves several.
-pub fn one(sessions: &[SessionInfo], query: Option<&str>, offer: Offer, prompt: &str) -> Result<String> {
+pub fn one(
+    sessions: &[SessionInfo],
+    query: Option<&str>,
+    offer: Offer,
+    prompt: &str,
+) -> Result<String> {
     match query {
         Some(query) => {
             let hits = matching(sessions, query)?;
             if let [only] = hits[..] {
                 return Ok(only.id.clone());
             }
-            let why = format!("`{query}` matches {} sessions; pass more of the id to --session", hits.len());
-            choose(&hits, &format!("`{query}` matches {} sessions. {prompt}", hits.len()), &why)
+            let why = format!(
+                "`{query}` matches {} sessions; pass more of the id to --session",
+                hits.len()
+            );
+            choose(
+                &hits,
+                &format!("`{query}` matches {} sessions. {prompt}", hits.len()),
+                &why,
+            )
         }
         None => {
             let candidates = offered(sessions, offer)?;
             if let [only] = candidates[..] {
                 return Ok(chosen_for_you(only));
             }
-            let why = format!("{} {}; pick one with --session", candidates.len(), offer.noun());
+            let why = format!(
+                "{} {}; pick one with --session",
+                candidates.len(),
+                offer.noun()
+            );
             choose(&candidates, prompt, &why)
         }
     }
@@ -69,14 +88,24 @@ pub fn one(sessions: &[SessionInfo], query: Option<&str>, offer: Offer, prompt: 
 
 /// The ids of the sessions `queries` name, or of the sessions picked from
 /// those `offer` includes when there are no queries.
-pub fn many(sessions: &[SessionInfo], queries: &[String], offer: Offer, prompt: &str) -> Result<Vec<String>> {
+pub fn many(
+    sessions: &[SessionInfo],
+    queries: &[String],
+    offer: Offer,
+    prompt: &str,
+) -> Result<Vec<String>> {
     if queries.is_empty() {
         let candidates = offered(sessions, offer)?;
         if let [only] = candidates[..] {
             return Ok(vec![chosen_for_you(only)]);
         }
         if !interactive() {
-            bail!("{} {}; pick with --session\n{}", candidates.len(), offer.noun(), rows(&candidates));
+            bail!(
+                "{} {}; pick with --session\n{}",
+                candidates.len(),
+                offer.noun(),
+                rows(&candidates)
+            );
         }
         let mut picker = cliclack::multiselect(prompt).required(true);
         for s in &candidates {
@@ -114,7 +143,11 @@ fn offered(sessions: &[SessionInfo], offer: Offer) -> Result<Vec<&SessionInfo>> 
         bail!("no {}", offer.noun());
     }
     // Most recently active first: usually the one meant.
-    candidates.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+    candidates.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(candidates)
 }
 

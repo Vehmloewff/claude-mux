@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::Command;
 
 use crate::paths;
@@ -30,7 +30,9 @@ impl Conn {
         if self.reader.read_line(&mut line).await? == 0 {
             return Ok(None);
         }
-        Ok(Some(serde_json::from_str(&line).context("bad message from daemon")?))
+        Ok(Some(
+            serde_json::from_str(&line).context("bad message from daemon")?,
+        ))
     }
 
     /// Split into the reading and writing halves, for long-lived streams.
@@ -42,7 +44,10 @@ impl Conn {
 async fn try_connect() -> Option<Conn> {
     let stream = UnixStream::connect(paths::socket()).await.ok()?;
     let (reader, writer) = stream.into_split();
-    Some(Conn { reader: BufReader::new(reader), writer })
+    Some(Conn {
+        reader: BufReader::new(reader),
+        writer,
+    })
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -95,7 +100,9 @@ pub async fn connect_existing() -> Option<Conn> {
 /// Stop the daemon (whatever its version) and wait for it to finish stopping
 /// sessions. Returns false if no daemon was running.
 pub async fn shutdown() -> Result<bool> {
-    let Some(mut conn) = try_connect().await else { return Ok(false) };
+    let Some(mut conn) = try_connect().await else {
+        return Ok(false);
+    };
     conn.send(&Request::Shutdown).await?;
     let _ = conn.recv::<Response>().await;
     for _ in 0..100 {

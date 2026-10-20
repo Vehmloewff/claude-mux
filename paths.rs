@@ -5,7 +5,9 @@ pub fn home() -> PathBuf {
     if let Some(dir) = std::env::var_os("CLAUDE_MUX_HOME") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| "/tmp".into());
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/tmp".into());
     home.join(".claude-mux")
 }
 
@@ -23,7 +25,10 @@ pub fn socket() -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     home().hash(&mut h);
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/claude-mux-{uid}-{:012x}.sock", h.finish() & 0xffff_ffff_ffff))
+    PathBuf::from(format!(
+        "/tmp/claude-mux-{uid}-{:012x}.sock",
+        h.finish() & 0xffff_ffff_ffff
+    ))
 }
 
 pub fn db_file() -> PathBuf {

@@ -12,14 +12,14 @@ use ratatui::crossterm::event::{
     EventStream, KeyCode as CtKey, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color as TColor, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::client;
 use crate::protocol::*;
@@ -50,11 +50,18 @@ struct TextInput {
 
 impl TextInput {
     fn new(text: &str) -> Self {
-        TextInput { text: text.to_string(), cursor: text.chars().count() }
+        TextInput {
+            text: text.to_string(),
+            cursor: text.chars().count(),
+        }
     }
 
     fn byte_pos(&self, char_pos: usize) -> usize {
-        self.text.char_indices().nth(char_pos).map(|(i, _)| i).unwrap_or(self.text.len())
+        self.text
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.text.len())
     }
 
     fn insert(&mut self, s: &str) {
@@ -118,10 +125,22 @@ impl TextInput {
 }
 
 enum Modal {
-    New { fields: [TextInput; 3], field: usize },
-    Send { id: String, input: TextInput },
-    Describe { id: String, input: TextInput },
-    Confirm { prompt: String, action: Confirmed },
+    New {
+        fields: [TextInput; 3],
+        field: usize,
+    },
+    Send {
+        id: String,
+        input: TextInput,
+    },
+    Describe {
+        id: String,
+        input: TextInput,
+    },
+    Confirm {
+        prompt: String,
+        action: Confirmed,
+    },
     Help,
 }
 
@@ -163,9 +182,10 @@ pub async fn run(initial: Option<String>, attach: bool) -> Result<()> {
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Ok(ev) = serde_json::from_str::<StreamEvent>(&line)
-                    && tx.send(AppMsg::Stream(ev)).is_err() {
-                        return;
-                    }
+                    && tx.send(AppMsg::Stream(ev)).is_err()
+                {
+                    return;
+                }
             }
             let _ = tx.send(AppMsg::Disconnected);
         });
@@ -219,7 +239,11 @@ pub async fn run(initial: Option<String>, attach: bool) -> Result<()> {
 }
 
 impl App {
-    async fn event_loop(&mut self, term: &mut DefaultTerminal, mut rx: UnboundedReceiver<AppMsg>) -> Result<()> {
+    async fn event_loop(
+        &mut self,
+        term: &mut DefaultTerminal,
+        mut rx: UnboundedReceiver<AppMsg>,
+    ) -> Result<()> {
         let mut last_draw = Instant::now() - Duration::from_secs(1);
         let mut dirty = true;
         let mut input = EventStream::new();
@@ -272,7 +296,10 @@ impl App {
                 if successor.is_some() {
                     self.selected = successor;
                 }
-                let still_there = self.selected.as_ref().is_some_and(|id| self.sessions.iter().any(|s| &s.id == id));
+                let still_there = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|id| self.sessions.iter().any(|s| &s.id == id));
                 if !still_there {
                     self.selected = self.sessions.last().map(|s| s.id.clone());
                     if self.selected.is_none() {
@@ -298,7 +325,9 @@ impl App {
     }
 
     fn send_event(&mut self, ev: &ClientEvent) {
-        let Ok(mut line) = serde_json::to_vec(ev) else { return };
+        let Ok(mut line) = serde_json::to_vec(ev) else {
+            return;
+        };
         line.push(b'\n');
         let _ = self.events.send(line);
     }
@@ -307,7 +336,11 @@ impl App {
     fn sync_watch(&mut self) {
         let want = (self.selected.clone(), self.pane.width, self.pane.height);
         if self.watching.as_ref() != Some(&want) && want.1 > 0 && want.2 > 0 {
-            self.send_event(&ClientEvent::Watch { id: want.0.clone(), cols: want.1, rows: want.2 });
+            self.send_event(&ClientEvent::Watch {
+                id: want.0.clone(),
+                cols: want.1,
+                rows: want.2,
+            });
             if self.watching.as_ref().map(|w| &w.0) != Some(&want.0) {
                 self.screen = None;
             }
@@ -375,22 +408,38 @@ impl App {
                         input.insert(&text);
                     }
                 } else if self.focus == Focus::Terminal
-                    && let Some(id) = self.selected.clone() {
-                        self.send_event(&ClientEvent::Paste { id, text });
-                    }
+                    && let Some(id) = self.selected.clone()
+                {
+                    self.send_event(&ClientEvent::Paste { id, text });
+                }
             }
             Event::Mouse(m) => {
                 let pos = Position::new(m.column, m.row);
                 match m.kind {
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.pane.contains(pos) => {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if self.pane.contains(pos) =>
+                    {
                         if let Some(id) = self.selected.clone() {
-                            let delta = if m.kind == MouseEventKind::ScrollUp { -3 } else { 3 };
+                            let delta = if m.kind == MouseEventKind::ScrollUp {
+                                -3
+                            } else {
+                                3
+                            };
                             let (col, row) = (m.column - self.pane.x, m.row - self.pane.y);
-                            self.send_event(&ClientEvent::Scroll { id, delta, col, row });
+                            self.send_event(&ClientEvent::Scroll {
+                                id,
+                                delta,
+                                col,
+                                row,
+                            });
                         }
                     }
-                    MouseEventKind::ScrollUp if self.sidebar.contains(pos) => self.move_selection(-1),
-                    MouseEventKind::ScrollDown if self.sidebar.contains(pos) => self.move_selection(1),
+                    MouseEventKind::ScrollUp if self.sidebar.contains(pos) => {
+                        self.move_selection(-1)
+                    }
+                    MouseEventKind::ScrollDown if self.sidebar.contains(pos) => {
+                        self.move_selection(1)
+                    }
                     MouseEventKind::Down(MouseButton::Left) if self.modal.is_none() => {
                         if self.sidebar.contains(pos) {
                             let idx = (m.row.saturating_sub(self.sidebar.y + 1) / 3) as usize;
@@ -476,9 +525,15 @@ impl App {
                 }
             }
             CtKey::Char('n') | CtKey::Char('c') => {
-                let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 self.modal = Some(Modal::New {
-                    fields: [TextInput::default(), TextInput::new(&cwd), TextInput::default()],
+                    fields: [
+                        TextInput::default(),
+                        TextInput::new(&cwd),
+                        TextInput::default(),
+                    ],
                     field: 0,
                 });
             }
@@ -486,8 +541,17 @@ impl App {
             CtKey::PageUp | CtKey::PageDown => {
                 if let Some(id) = self.selected.clone() {
                     let page = self.pane.height.max(2) as i32 - 1;
-                    let delta = if key.code == CtKey::PageUp { -page } else { page };
-                    self.send_event(&ClientEvent::Scroll { id, delta, col: 0, row: 0 });
+                    let delta = if key.code == CtKey::PageUp {
+                        -page
+                    } else {
+                        page
+                    };
+                    self.send_event(&ClientEvent::Scroll {
+                        id,
+                        delta,
+                        col: 0,
+                        row: 0,
+                    });
                 }
             }
             CtKey::Esc => {
@@ -501,7 +565,10 @@ impl App {
         match key.code {
             CtKey::Char('s') | CtKey::Char('m') => {
                 if s.status.is_live() {
-                    self.modal = Some(Modal::Send { id: s.id.clone(), input: TextInput::default() });
+                    self.modal = Some(Modal::Send {
+                        id: s.id.clone(),
+                        input: TextInput::default(),
+                    });
                 } else {
                     self.flash("session is not running (press r to resume)", true);
                 }
@@ -516,11 +583,19 @@ impl App {
                 if s.status.is_live() && !s.asleep {
                     self.flash("session is already running", true);
                 } else {
-                    self.command(Request::Resume { id: s.id.clone() }, format!("resumed {}", s.short_id()), false);
+                    self.command(
+                        Request::Resume { id: s.id.clone() },
+                        format!("resumed {}", s.short_id()),
+                        false,
+                    );
                 }
             }
             CtKey::Char('d') | CtKey::Delete => {
-                let warn = if s.status.is_live() { " This kills the running claude." } else { "" };
+                let warn = if s.status.is_live() {
+                    " This kills the running claude."
+                } else {
+                    ""
+                };
                 self.modal = Some(Modal::Confirm {
                     prompt: format!("Remove session {}?{warn}", s.short_id()),
                     action: Confirmed::Remove(s.id.clone()),
@@ -528,15 +603,21 @@ impl App {
             }
             CtKey::Char('R') => {
                 let current = s.description.clone().unwrap_or_default();
-                self.modal = Some(Modal::Describe { id: s.id.clone(), input: TextInput::new(&current) });
+                self.modal = Some(Modal::Describe {
+                    id: s.id.clone(),
+                    input: TextInput::new(&current),
+                });
             }
             _ => {}
         }
     }
 
     fn on_modal_key(&mut self, key: KeyEvent) {
-        let Some(mut modal) = self.modal.take() else { return };
-        let esc = key.code == CtKey::Esc || (key.code == CtKey::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        let Some(mut modal) = self.modal.take() else {
+            return;
+        };
+        let esc = key.code == CtKey::Esc
+            || (key.code == CtKey::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
         if esc {
             return;
         }
@@ -545,17 +626,27 @@ impl App {
             Modal::Confirm { action, .. } => {
                 if matches!(key.code, CtKey::Char('y') | CtKey::Char('Y') | CtKey::Enter) {
                     match action {
-                        Confirmed::Kill(id) => self.command(Request::Kill { id: id.clone() }, format!("killed {id}"), false),
-                        Confirmed::Remove(id) => {
-                            self.command(Request::Remove { id: id.clone() }, format!("removed {id}"), false)
-                        }
+                        Confirmed::Kill(id) => self.command(
+                            Request::Kill { id: id.clone() },
+                            format!("killed {id}"),
+                            false,
+                        ),
+                        Confirmed::Remove(id) => self.command(
+                            Request::Remove { id: id.clone() },
+                            format!("removed {id}"),
+                            false,
+                        ),
                     }
                 }
                 false
             }
             Modal::Send { id, input } => match key.code {
                 CtKey::Enter if !input.text.trim().is_empty() => {
-                    let req = Request::Send { id: id.clone(), message: input.text.clone(), now: false };
+                    let req = Request::Send {
+                        id: id.clone(),
+                        message: input.text.clone(),
+                        now: false,
+                    };
                     self.command(req, format!("sent to {}", short_id(id)), false);
                     false
                 }
@@ -566,7 +657,10 @@ impl App {
             },
             Modal::Describe { id, input } => match key.code {
                 CtKey::Enter => {
-                    let req = Request::Describe { id: id.clone(), description: Some(input.text.trim().to_string()) };
+                    let req = Request::Describe {
+                        id: id.clone(),
+                        description: Some(input.text.trim().to_string()),
+                    };
                     self.command(req, "description saved", false);
                     false
                 }
@@ -587,7 +681,9 @@ impl App {
                 CtKey::Enter => {
                     let cwd = fields[1].text.trim();
                     let cwd = match cwd.strip_prefix('~') {
-                        Some(rest) => format!("{}{rest}", std::env::var("HOME").unwrap_or_default()),
+                        Some(rest) => {
+                            format!("{}{rest}", std::env::var("HOME").unwrap_or_default())
+                        }
                         None => cwd.to_string(),
                     };
                     let description = fields[2].text.trim();
@@ -616,9 +712,11 @@ impl App {
     // Drawing
 
     fn draw(&mut self, f: &mut Frame) {
-        let [main, bar] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
+        let [main, bar] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
         let sidebar_w = SIDEBAR_WIDTH.min(main.width / 2);
-        let [side, right] = Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(10)]).areas(main);
+        let [side, right] =
+            Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(10)]).areas(main);
         self.sidebar = side;
         self.draw_sidebar(f, side);
         self.draw_pane(f, right);
@@ -635,9 +733,15 @@ impl App {
         let tick = (self.started.elapsed().as_millis() / 100) as usize;
         match status {
             Status::Starting => ("◌".into(), Style::new().fg(TColor::DarkGray)),
-            Status::Working => (SPINNER[tick % SPINNER.len()].into(), Style::new().fg(TColor::Yellow)),
+            Status::Working => (
+                SPINNER[tick % SPINNER.len()].into(),
+                Style::new().fg(TColor::Yellow),
+            ),
             Status::NeedsInput => ("◆".into(), Style::new().fg(TColor::Magenta).bold()),
-            Status::Background => (["◴", "◷", "◶", "◵"][tick / 3 % 4].into(), Style::new().fg(TColor::Blue)),
+            Status::Background => (
+                ["◴", "◷", "◶", "◵"][tick / 3 % 4].into(),
+                Style::new().fg(TColor::Blue),
+            ),
             Status::Idle => ("●".into(), Style::new().fg(TColor::Green)),
             Status::Exited => ("✕".into(), Style::new().fg(TColor::DarkGray)),
             Status::Stopped => ("◼".into(), Style::new().fg(TColor::DarkGray)),
@@ -646,7 +750,12 @@ impl App {
 
     fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::List && self.modal.is_none();
-        let counts = |pred: fn(Status) -> bool| self.sessions.iter().filter(|s| pred(s.effective_status())).count();
+        let counts = |pred: fn(Status) -> bool| {
+            self.sessions
+                .iter()
+                .filter(|s| pred(s.effective_status()))
+                .count()
+        };
         let working = counts(|s| matches!(s, Status::Working | Status::Starting));
         let waiting = counts(|s| s == Status::NeedsInput);
         let mut title = vec![TSpan::raw(" claude-mux ").bold()];
@@ -659,7 +768,11 @@ impl App {
         let block = Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(if focused { Style::new().fg(TColor::Cyan) } else { Style::new().fg(TColor::DarkGray) })
+            .border_style(if focused {
+                Style::new().fg(TColor::Cyan)
+            } else {
+                Style::new().fg(TColor::DarkGray)
+            })
             .title(Line::from(title));
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -669,7 +782,11 @@ impl App {
                 Line::raw(""),
                 Line::raw("No sessions yet.").fg(TColor::Gray),
                 Line::raw(""),
-                Line::from(vec![TSpan::raw("Press "), TSpan::raw("n").bold().fg(TColor::Cyan), TSpan::raw(" to start one,")]),
+                Line::from(vec![
+                    TSpan::raw("Press "),
+                    TSpan::raw("n").bold().fg(TColor::Cyan),
+                    TSpan::raw(" to start one,"),
+                ]),
                 Line::raw("or run:").fg(TColor::Gray),
                 Line::raw("claude-mux create \"…\"").fg(TColor::Cyan),
             ])
@@ -688,7 +805,11 @@ impl App {
             let selected = self.selected.as_deref() == Some(&s.id);
             let row = Rect::new(inner.x, y, inner.width, 2);
             let base = if selected {
-                Style::new().bg(if focused { TColor::Indexed(237) } else { TColor::Indexed(235) })
+                Style::new().bg(if focused {
+                    TColor::Indexed(237)
+                } else {
+                    TColor::Indexed(235)
+                })
             } else {
                 Style::new()
             };
@@ -697,7 +818,11 @@ impl App {
             let status = s.effective_status();
             let (icon, icon_style) = self.status_icon(status, s.asleep);
             let label = s.status_label();
-            let num = if i < 9 { format!("{}", i + 1) } else { " ".into() };
+            let num = if i < 9 {
+                format!("{}", i + 1)
+            } else {
+                " ".into()
+            };
             let name_w = width.saturating_sub(label.len() + 6);
             let name = fit(s.display_name(), name_w);
             let pad = width.saturating_sub(4 + display_width(&name) + label.len() + 1);
@@ -713,17 +838,37 @@ impl App {
                 TSpan::raw(" "),
                 TSpan::styled(icon, icon_style),
                 TSpan::raw(" "),
-                TSpan::styled(name, if selected { Style::new().bold() } else { Style::new() }),
+                TSpan::styled(
+                    name,
+                    if selected {
+                        Style::new().bold()
+                    } else {
+                        Style::new()
+                    },
+                ),
                 TSpan::raw(" ".repeat(pad)),
                 TSpan::styled(label, label_style),
             ]);
             let detail = match (&s.status_detail, status) {
-                (Some(d), Status::NeedsInput | Status::Background | Status::Exited | Status::Stopped) => d.clone(),
+                (
+                    Some(d),
+                    Status::NeedsInput | Status::Background | Status::Exited | Status::Stopped,
+                ) => d.clone(),
                 _ => {
-                    let queued = if s.queued > 0 { format!(" · {} queued", s.queued) } else { String::new() };
+                    let queued = if s.queued > 0 {
+                        format!(" · {} queued", s.queued)
+                    } else {
+                        String::new()
+                    };
                     let fixed = format!("{} ·  · {}{}", s.short_id(), ago(s.updated_at), queued);
                     let room = width.saturating_sub(4 + display_width(&fixed));
-                    format!("{} · {} · {}{}", s.short_id(), fit_left(&short_path(&s.cwd), room), ago(s.updated_at), queued)
+                    format!(
+                        "{} · {} · {}{}",
+                        s.short_id(),
+                        fit_left(&short_path(&s.cwd), room),
+                        ago(s.updated_at),
+                        queued
+                    )
                 }
             };
             let line2 = Line::from(TSpan::styled(
@@ -737,8 +882,15 @@ impl App {
     fn draw_pane(&mut self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Terminal && self.modal.is_none();
         let session = self.selected_session().cloned();
-        let border = if focused { Style::new().fg(TColor::Cyan) } else { Style::new().fg(TColor::DarkGray) };
-        let mut block = Block::new().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(border);
+        let border = if focused {
+            Style::new().fg(TColor::Cyan)
+        } else {
+            Style::new().fg(TColor::DarkGray)
+        };
+        let mut block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border);
         if let Some(s) = &session {
             let (icon, icon_style) = self.status_icon(s.effective_status(), s.asleep);
             let mut title = vec![
@@ -749,9 +901,10 @@ impl App {
                 TSpan::raw(format!(" · {} ", s.short_id())).fg(TColor::DarkGray),
             ];
             if let Some((_, screen)) = &self.screen
-                && screen.scrolled {
-                    title.push(TSpan::raw("[scrollback · esc to return] ").fg(TColor::Yellow));
-                }
+                && screen.scrolled
+            {
+                title.push(TSpan::raw("[scrollback · esc to return] ").fg(TColor::Yellow));
+            }
             let used: usize = title.iter().map(|t| display_width(&t.content)).sum();
             let room = (area.width as usize).saturating_sub(used + 6);
             block = block.title(Line::from(title));
@@ -767,15 +920,22 @@ impl App {
         self.pane = inner;
 
         let Some(s) = session else { return };
-        let screen = self.screen.as_ref().filter(|(id, _)| id == &s.id).map(|(_, sc)| sc);
+        let screen = self
+            .screen
+            .as_ref()
+            .filter(|(id, _)| id == &s.id)
+            .map(|(_, sc)| sc);
         match screen {
             Some(screen) if screen.cols > 0 => {
                 render_screen(f.buffer_mut(), inner, screen);
                 if focused
                     && let Some((x, y)) = screen.cursor
-                        && x < inner.width && y < inner.height && !screen.scrolled {
-                            f.set_cursor_position(Position::new(inner.x + x, inner.y + y));
-                        }
+                    && x < inner.width
+                    && y < inner.height
+                    && !screen.scrolled
+                {
+                    f.set_cursor_position(Position::new(inner.x + x, inner.y + y));
+                }
             }
             _ => {
                 let text = match (s.status, &s.continued_as) {
@@ -789,8 +949,16 @@ impl App {
                     ),
                     _ => "Connecting…".into(),
                 };
-                let p = Paragraph::new(text).fg(TColor::Gray).centered().wrap(Wrap { trim: true });
-                let mid = Rect::new(inner.x, inner.y + inner.height / 3, inner.width, inner.height.saturating_sub(inner.height / 3));
+                let p = Paragraph::new(text)
+                    .fg(TColor::Gray)
+                    .centered()
+                    .wrap(Wrap { trim: true });
+                let mid = Rect::new(
+                    inner.x,
+                    inner.y + inner.height / 3,
+                    inner.width,
+                    inner.height.saturating_sub(inner.height / 3),
+                );
                 f.render_widget(p, mid);
             }
         }
@@ -798,25 +966,40 @@ impl App {
 
     fn draw_bar(&mut self, f: &mut Frame, area: Rect) {
         if let Some((text, err, at)) = &self.flash
-            && at.elapsed() < Duration::from_secs(4) {
-                let style = if *err { Style::new().fg(TColor::Red) } else { Style::new().fg(TColor::Green) };
-                f.render_widget(Paragraph::new(format!(" {text}")).style(style), area);
-                return;
-            }
+            && at.elapsed() < Duration::from_secs(4)
+        {
+            let style = if *err {
+                Style::new().fg(TColor::Red)
+            } else {
+                Style::new().fg(TColor::Green)
+            };
+            f.render_widget(Paragraph::new(format!(" {text}")).style(style), area);
+            return;
+        }
         let key = |k: &'static str| TSpan::raw(k).fg(TColor::Cyan).bold();
         let txt = |t: &'static str| TSpan::raw(t).fg(TColor::Gray);
         let line = if !self.connected {
-            Line::from(vec![TSpan::raw(" daemon disconnected — restart manage ").fg(TColor::Red), key("q"), txt(" quit")])
+            Line::from(vec![
+                TSpan::raw(" daemon disconnected — restart manage ").fg(TColor::Red),
+                key("q"),
+                txt(" quit"),
+            ])
         } else if self.focus == Focus::Terminal {
             Line::from(vec![
-                TSpan::raw(" TERMINAL ").bold().fg(TColor::Black).bg(TColor::Cyan),
+                TSpan::raw(" TERMINAL ")
+                    .bold()
+                    .fg(TColor::Black)
+                    .bg(TColor::Cyan),
                 txt("  typing goes to claude · "),
                 key("ctrl-]"),
                 txt(" back to sessions"),
             ])
         } else {
             Line::from(vec![
-                TSpan::raw(" SESSIONS ").bold().fg(TColor::Black).bg(TColor::Green),
+                TSpan::raw(" SESSIONS ")
+                    .bold()
+                    .fg(TColor::Black)
+                    .bg(TColor::Green),
                 TSpan::raw("  "),
                 key("enter"),
                 txt(" focus  "),
@@ -851,7 +1034,12 @@ impl App {
             Modal::Help => (" Keys ", 22),
         };
         let h = h.min(area.height.saturating_sub(2));
-        let rect = Rect::new(area.x + (area.width - w) / 2, area.y + (area.height.saturating_sub(h)) / 3, w, h);
+        let rect = Rect::new(
+            area.x + (area.width - w) / 2,
+            area.y + (area.height.saturating_sub(h)) / 3,
+            w,
+            h,
+        );
         f.render_widget(Clear, rect);
         let block = Block::new()
             .borders(Borders::ALL)
@@ -868,8 +1056,15 @@ impl App {
                 let mut y = inner.y;
                 for (i, input) in fields.iter().enumerate() {
                     let active = i == *field;
-                    let label_style = if active { Style::new().fg(TColor::Cyan).bold() } else { Style::new().fg(TColor::Gray) };
-                    f.render_widget(Paragraph::new(NEW_FIELDS[i]).style(label_style), Rect::new(inner.x, y, inner.width, 1));
+                    let label_style = if active {
+                        Style::new().fg(TColor::Cyan).bold()
+                    } else {
+                        Style::new().fg(TColor::Gray)
+                    };
+                    f.render_widget(
+                        Paragraph::new(NEW_FIELDS[i]).style(label_style),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
                     y += 1;
                     let r = Rect::new(inner.x, y, inner.width, heights[i]);
                     draw_input(f, r, input, active);
@@ -877,31 +1072,65 @@ impl App {
                 }
                 f.render_widget(
                     Paragraph::new(hint("tab next field · enter create · esc cancel")),
-                    Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), inner.width, 1),
+                    Rect::new(
+                        inner.x,
+                        inner.y + inner.height.saturating_sub(1),
+                        inner.width,
+                        1,
+                    ),
                 );
             }
             Modal::Send { id, input } => {
                 f.render_widget(
-                    Paragraph::new(format!("To {} (delivered when claude is idle)", short_id(id))).fg(TColor::Gray),
+                    Paragraph::new(format!(
+                        "To {} (delivered when claude is idle)",
+                        short_id(id)
+                    ))
+                    .fg(TColor::Gray),
                     Rect::new(inner.x, inner.y, inner.width, 1),
                 );
-                draw_input(f, Rect::new(inner.x, inner.y + 1, inner.width, 4), input, true);
+                draw_input(
+                    f,
+                    Rect::new(inner.x, inner.y + 1, inner.width, 4),
+                    input,
+                    true,
+                );
                 f.render_widget(
                     Paragraph::new(hint("enter send · esc cancel")),
-                    Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), inner.width, 1),
+                    Rect::new(
+                        inner.x,
+                        inner.y + inner.height.saturating_sub(1),
+                        inner.width,
+                        1,
+                    ),
                 );
             }
             Modal::Describe { input, .. } => {
-                draw_input(f, Rect::new(inner.x, inner.y + 1, inner.width, 1), input, true);
+                draw_input(
+                    f,
+                    Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                    input,
+                    true,
+                );
                 f.render_widget(
                     Paragraph::new(hint("enter save (empty clears) · esc cancel")),
-                    Rect::new(inner.x, inner.y + inner.height.saturating_sub(1), inner.width, 1),
+                    Rect::new(
+                        inner.x,
+                        inner.y + inner.height.saturating_sub(1),
+                        inner.width,
+                        1,
+                    ),
                 );
             }
             Modal::Confirm { prompt, .. } => {
                 let p = Paragraph::new(vec![
                     Line::raw(prompt.as_str()),
-                    Line::from(vec![TSpan::raw("y").bold().fg(TColor::Cyan), TSpan::raw(" yes   "), TSpan::raw("n/esc").bold().fg(TColor::Cyan), TSpan::raw(" no")]),
+                    Line::from(vec![
+                        TSpan::raw("y").bold().fg(TColor::Cyan),
+                        TSpan::raw(" yes   "),
+                        TSpan::raw("n/esc").bold().fg(TColor::Cyan),
+                        TSpan::raw(" no"),
+                    ]),
                 ])
                 .wrap(Wrap { trim: true });
                 f.render_widget(p, inner.inner(ratatui::layout::Margin::new(0, 1)));
@@ -925,29 +1154,49 @@ impl App {
                 ];
                 let mut lines: Vec<Line> = rows
                     .iter()
-                    .map(|(k, v)| Line::from(vec![TSpan::raw(format!("{k:<16}")).fg(TColor::Cyan).bold(), TSpan::raw(*v)]))
+                    .map(|(k, v)| {
+                        Line::from(vec![
+                            TSpan::raw(format!("{k:<16}")).fg(TColor::Cyan).bold(),
+                            TSpan::raw(*v),
+                        ])
+                    })
                     .collect();
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
-                    TSpan::raw("◌ ").fg(TColor::DarkGray), TSpan::raw("starting  "),
-                    TSpan::raw("⠋ ").fg(TColor::Yellow), TSpan::raw("working  "),
-                    TSpan::raw("◆ ").fg(TColor::Magenta), TSpan::raw("needs input  "),
-                    TSpan::raw("◷ ").fg(TColor::Blue), TSpan::raw("background tasks"),
+                    TSpan::raw("◌ ").fg(TColor::DarkGray),
+                    TSpan::raw("starting  "),
+                    TSpan::raw("⠋ ").fg(TColor::Yellow),
+                    TSpan::raw("working  "),
+                    TSpan::raw("◆ ").fg(TColor::Magenta),
+                    TSpan::raw("needs input  "),
+                    TSpan::raw("◷ ").fg(TColor::Blue),
+                    TSpan::raw("background tasks"),
                 ]));
                 lines.push(Line::from(vec![
-                    TSpan::raw("● ").fg(TColor::Green), TSpan::raw("idle  "),
-                    TSpan::raw("○ ").fg(TColor::Green), TSpan::raw("asleep  "),
-                    TSpan::raw("✕ ").fg(TColor::DarkGray), TSpan::raw("exited   "),
-                    TSpan::raw("◼ ").fg(TColor::DarkGray), TSpan::raw("stopped"),
+                    TSpan::raw("● ").fg(TColor::Green),
+                    TSpan::raw("idle  "),
+                    TSpan::raw("○ ").fg(TColor::Green),
+                    TSpan::raw("asleep  "),
+                    TSpan::raw("✕ ").fg(TColor::DarkGray),
+                    TSpan::raw("exited   "),
+                    TSpan::raw("◼ ").fg(TColor::DarkGray),
+                    TSpan::raw("stopped"),
                 ]));
-                f.render_widget(Paragraph::new(lines), inner.inner(ratatui::layout::Margin::new(0, 1)));
+                f.render_widget(
+                    Paragraph::new(lines),
+                    inner.inner(ratatui::layout::Margin::new(0, 1)),
+                );
             }
         }
     }
 }
 
 fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, active: bool) {
-    let bg = if active { TColor::Indexed(236) } else { TColor::Indexed(234) };
+    let bg = if active {
+        TColor::Indexed(236)
+    } else {
+        TColor::Indexed(234)
+    };
     f.buffer_mut().set_style(area, Style::new().bg(bg));
     // Simple character wrapping so the cursor position is easy to compute.
     let width = area.width.max(1) as usize;
@@ -986,7 +1235,10 @@ fn draw_input(f: &mut Frame, area: Rect, input: &TextInput, active: bool) {
     let visible: Vec<Line> = lines.into_iter().skip(skip).map(Line::raw).collect();
     f.render_widget(Paragraph::new(visible).style(Style::new().bg(bg)), area);
     if active {
-        f.set_cursor_position(Position::new(area.x + cursor_pos.0, area.y + cursor_pos.1 - skip as u16));
+        f.set_cursor_position(Position::new(
+            area.x + cursor_pos.0,
+            area.y + cursor_pos.1 - skip as u16,
+        ));
     }
 }
 
@@ -1083,7 +1335,11 @@ fn render_screen(buf: &mut Buffer, area: Rect, screen: &Screen) {
             if span.x >= area.width {
                 continue;
             }
-            let style = screen.styles.get(span.s as usize).map(to_style).unwrap_or_default();
+            let style = screen
+                .styles
+                .get(span.s as usize)
+                .map(to_style)
+                .unwrap_or_default();
             let max = (area.width - span.x) as usize;
             buf.set_stringn(area.x + span.x, area.y + y as u16, &span.t, max, style);
         }

@@ -2,8 +2,8 @@
 //! A local HTTP server stands in for GitHub releases.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
 use std::net::TcpListener;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,8 @@ struct Sandbox(PathBuf);
 
 impl Sandbox {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("claude-mux-cli-test-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("claude-mux-cli-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::create_dir(root.join("state")).unwrap();
         Self(root)
@@ -41,7 +42,11 @@ impl Sandbox {
     fn run(&self, args: &[&str]) -> Output {
         let mut command = self.command(args, None);
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         output
     }
 }
@@ -88,13 +93,20 @@ impl Releases {
                              Content-Length: 0\r\nConnection: close\r\n\r\n"
                         );
                     } else {
-                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
                     }
                     let _ = stream.flush();
                 });
             }
         });
-        Self { base: format!("http://127.0.0.1:{port}"), latest_requests, _thread: thread }
+        Self {
+            base: format!("http://127.0.0.1:{port}"),
+            latest_requests,
+            _thread: thread,
+        }
     }
 
     fn latest_requests(&self) -> usize {
@@ -109,7 +121,10 @@ fn internal_commands_and_explicit_upgrade_skip_automatic_checks() {
     sandbox.run(&["hook", "Stop"]);
     // Hold the daemon lock so this test cannot start a long-lived process.
     let lock = std::fs::File::create(sandbox.0.join("state/daemon.lock")).unwrap();
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
     sandbox.run(&["daemon"]);
     sandbox.run(&["upgrade", "--version", env!("CARGO_PKG_VERSION")]);
     sandbox.run(&["--version"]);
@@ -133,8 +148,15 @@ fn available_updates_are_reported_on_every_user_command_without_refetching() {
     let sandbox = Sandbox::new();
     let releases = Releases::new();
     for _ in 0..2 {
-        let output = sandbox.command(&["shutdown"], Some(&releases.base)).output().unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let output = sandbox
+            .command(&["shutdown"], Some(&releases.base))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(String::from_utf8_lossy(&output.stderr).contains("update v999.0.0 available"));
         assert!(output.stdout.is_empty());
     }
@@ -147,7 +169,12 @@ fn concurrent_commands_make_only_one_request() {
     let releases = Releases::new();
     let mut children = Vec::new();
     for _ in 0..4 {
-        children.push(sandbox.command(&["shutdown"], Some(&releases.base)).spawn().unwrap());
+        children.push(
+            sandbox
+                .command(&["shutdown"], Some(&releases.base))
+                .spawn()
+                .unwrap(),
+        );
     }
     for mut child in children {
         assert!(child.wait().unwrap().success());

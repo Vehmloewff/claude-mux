@@ -45,10 +45,18 @@ enum Msg {
     Resize(u16, u16),
     Key(KeyInput),
     Paste(String),
-    Scroll { delta: i32, col: u16, row: u16 },
+    Scroll {
+        delta: i32,
+        col: u16,
+        row: u16,
+    },
     ScrollReset,
     Snapshot(oneshot::Sender<Screen>),
-    Text { scrollback: bool, ansi: bool, reply: oneshot::Sender<String> },
+    Text {
+        scrollback: bool,
+        ansi: bool,
+        reply: oneshot::Sender<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -96,17 +104,34 @@ impl TermHandle {
             if !sent {
                 return None;
             }
-            tokio::time::timeout(Duration::from_secs(2), rx).await.ok().and_then(|r| r.ok())
+            tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
         }
     }
-    pub fn text(&self, scrollback: bool, ansi: bool) -> impl Future<Output = Option<String>> + Send {
+    pub fn text(
+        &self,
+        scrollback: bool,
+        ansi: bool,
+    ) -> impl Future<Output = Option<String>> + Send {
         let (tx, rx) = oneshot::channel();
-        let sent = self.tx.send(Msg::Text { scrollback, ansi, reply: tx }).is_ok();
+        let sent = self
+            .tx
+            .send(Msg::Text {
+                scrollback,
+                ansi,
+                reply: tx,
+            })
+            .is_ok();
         async move {
             if !sent {
                 return None;
             }
-            tokio::time::timeout(Duration::from_secs(2), rx).await.ok().and_then(|r| r.ok())
+            tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
         }
     }
 }
@@ -150,8 +175,15 @@ struct Emu {
 
 impl Emu {
     fn new(cols: u16, rows: u16, scrollback: usize, writer: PtyWriter) -> Emu {
-        let config = Config { scrolling_history: scrollback, kitty_keyboard: true, ..Config::default() };
-        let size = Size { cols: cols as usize, rows: rows as usize };
+        let config = Config {
+            scrolling_history: scrollback,
+            kitty_keyboard: true,
+            ..Config::default()
+        };
+        let size = Size {
+            cols: cols as usize,
+            rows: rows as usize,
+        };
         let events = Events::default();
         Emu {
             term: Term::new(config, &size, events.clone()),
@@ -328,8 +360,16 @@ fn handle(emu: &mut Emu, msg: Msg) -> bool {
             let _ = reply.send(snapshot(emu));
             false
         }
-        Msg::Text { scrollback, ansi, reply } => {
-            let text = if scrollback || ansi { format_screen(emu, scrollback, ansi) } else { viewport_text(emu) };
+        Msg::Text {
+            scrollback,
+            ansi,
+            reply,
+        } => {
+            let text = if scrollback || ansi {
+                format_screen(emu, scrollback, ansi)
+            } else {
+                viewport_text(emu)
+            };
             let _ = reply.send(text);
             false
         }
@@ -365,7 +405,12 @@ fn encode_key(mode: TermMode, input: &KeyInput) -> Vec<u8> {
     // Modifiers other than shift, which only changes the text of a char.
     let modified = input.ctrl || input.alt || input.sup;
     let csi_u = |code: u32, m: u8| {
-        if m == 1 { format!("\x1b[{code}u") } else { format!("\x1b[{code};{m}u") }.into_bytes()
+        if m == 1 {
+            format!("\x1b[{code}u")
+        } else {
+            format!("\x1b[{code};{m}u")
+        }
+        .into_bytes()
     };
     let esc = |mut bytes: Vec<u8>, alt: bool| {
         if alt {
@@ -403,7 +448,12 @@ fn encode_key(mode: TermMode, input: &KeyInput) -> Vec<u8> {
                 _ => esc(vec![plain], input.alt),
             }
         }
-        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left | KeyCode::Home | KeyCode::End => {
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Left
+        | KeyCode::Home
+        | KeyCode::End => {
             let letter = match input.code {
                 KeyCode::Up => 'A',
                 KeyCode::Down => 'B',
@@ -431,7 +481,12 @@ fn encode_key(mode: TermMode, input: &KeyInput) -> Vec<u8> {
         }
         KeyCode::F(n @ 1..=4) => {
             let letter = (b'P' + n - 1) as char;
-            if m != 1 { format!("\x1b[1;{m}{letter}") } else { format!("\x1bO{letter}") }.into_bytes()
+            if m != 1 {
+                format!("\x1b[1;{m}{letter}")
+            } else {
+                format!("\x1bO{letter}")
+            }
+            .into_bytes()
         }
         KeyCode::F(n @ 5..=12) => {
             const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
@@ -442,7 +497,12 @@ fn encode_key(mode: TermMode, input: &KeyInput) -> Vec<u8> {
 }
 
 fn tilde(n: u8, m: u8) -> Vec<u8> {
-    if m != 1 { format!("\x1b[{n};{m}~") } else { format!("\x1b[{n}~") }.into_bytes()
+    if m != 1 {
+        format!("\x1b[{n};{m}~")
+    } else {
+        format!("\x1b[{n}~")
+    }
+    .into_bytes()
 }
 
 /// The control code a ctrl+key chord produces in a legacy terminal.
@@ -467,7 +527,10 @@ fn unshifted(c: char) -> char {
     }
     const SHIFTED: &str = "~!@#$%^&*()_+{}|:\"<>?";
     const BASE: &str = "`1234567890-=[]\\;',./";
-    SHIFTED.find(c).and_then(|i| BASE.chars().nth(i)).unwrap_or(c)
+    SHIFTED
+        .find(c)
+        .and_then(|i| BASE.chars().nth(i))
+        .unwrap_or(c)
 }
 
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -501,10 +564,22 @@ fn encode_wheel(mode: TermMode, delta: i32, col: u16, row: u16) -> Vec<u8> {
 /// Default colors, reported when an application asks for them.
 fn default_color(index: usize) -> Rgb {
     const ANSI: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00), (0xcd, 0x00, 0x00), (0x00, 0xcd, 0x00), (0xcd, 0xcd, 0x00),
-        (0x00, 0x00, 0xee), (0xcd, 0x00, 0xcd), (0x00, 0xcd, 0xcd), (0xe5, 0xe5, 0xe5),
-        (0x7f, 0x7f, 0x7f), (0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0xff, 0xff, 0x00),
-        (0x5c, 0x5c, 0xff), (0xff, 0x00, 0xff), (0x00, 0xff, 0xff), (0xff, 0xff, 0xff),
+        (0x00, 0x00, 0x00),
+        (0xcd, 0x00, 0x00),
+        (0x00, 0xcd, 0x00),
+        (0xcd, 0xcd, 0x00),
+        (0x00, 0x00, 0xee),
+        (0xcd, 0x00, 0xcd),
+        (0x00, 0xcd, 0xcd),
+        (0xe5, 0xe5, 0xe5),
+        (0x7f, 0x7f, 0x7f),
+        (0xff, 0x00, 0x00),
+        (0x00, 0xff, 0x00),
+        (0xff, 0xff, 0x00),
+        (0x5c, 0x5c, 0xff),
+        (0xff, 0x00, 0xff),
+        (0x00, 0xff, 0xff),
+        (0xff, 0xff, 0xff),
     ];
     let (r, g, b) = match index {
         0..16 => ANSI[index],
@@ -549,8 +624,15 @@ fn style_of(cell: &Cell) -> CellStyle {
         (Flags::STRIKEOUT, protocol::ATTR_STRIKE),
         (Flags::HIDDEN, protocol::ATTR_INVISIBLE),
     ];
-    let a = ATTRS.iter().filter(|(f, _)| cell.flags.intersects(*f)).fold(0, |a, (_, bit)| a | bit);
-    CellStyle { fg: color_of(cell.fg), bg: color_of(cell.bg), a }
+    let a = ATTRS
+        .iter()
+        .filter(|(f, _)| cell.flags.intersects(*f))
+        .fold(0, |a, (_, bit)| a | bit);
+    CellStyle {
+        fg: color_of(cell.fg),
+        bg: color_of(cell.bg),
+        a,
+    }
 }
 
 /// The cells of one line: (column, grapheme, cell), skipping wide-char
@@ -559,7 +641,10 @@ fn line_cells(emu: &Emu, line: Line) -> impl Iterator<Item = (u16, String, &Cell
     let row = &emu.term.grid()[line];
     (0..emu.term.columns()).filter_map(move |x| {
         let cell = &row[Column(x)];
-        if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
             return None;
         }
         let mut grapheme = String::from(cell.c);
@@ -581,7 +666,9 @@ fn snapshot(emu: &Emu) -> Screen {
     let cursor = if emu.term.mode().contains(TermMode::SHOW_CURSOR) {
         let point = emu.term.grid().cursor.point;
         let y = point.line.0 + offset as i32;
-        (0..rows as i32).contains(&y).then_some((point.column.0 as u16, y as u16))
+        (0..rows as i32)
+            .contains(&y)
+            .then_some((point.column.0 as u16, y as u16))
     } else {
         None
     };
@@ -602,7 +689,11 @@ fn snapshot(emu: &Emu) -> Screen {
                 Some(last) if last.s == sid && !is_wide(&grapheme) && last_is_narrow(last) => {
                     last.t.push_str(&grapheme)
                 }
-                _ => spans.push(Span { x: col, t: grapheme, s: sid }),
+                _ => spans.push(Span {
+                    x: col,
+                    t: grapheme,
+                    s: sid,
+                }),
             }
         }
         // Drop trailing unstyled whitespace to keep frames small.
@@ -617,7 +708,14 @@ fn snapshot(emu: &Emu) -> Screen {
         }
         lines.push(spans);
     }
-    Screen { cols, rows, styles, lines, cursor, scrolled: offset > 0 }
+    Screen {
+        cols,
+        rows,
+        styles,
+        lines,
+        cursor,
+        scrolled: offset > 0,
+    }
 }
 
 fn is_wide(g: &str) -> bool {
@@ -627,7 +725,11 @@ fn is_wide(g: &str) -> bool {
 /// Spans are kept narrow-only so that column positions stay exact even if
 /// the viewer's width tables disagree with the emulator's.
 fn last_is_narrow(span: &Span) -> bool {
-    span.t.chars().last().map(|c| !is_wide(&c.to_string())).unwrap_or(true)
+    span.t
+        .chars()
+        .last()
+        .map(|c| !is_wide(&c.to_string()))
+        .unwrap_or(true)
 }
 
 /// The visible screen as plain text, one line per row.
@@ -646,7 +748,9 @@ fn viewport_text(emu: &Emu) -> String {
 fn format_screen(emu: &Emu, scrollback: bool, ansi: bool) -> String {
     let lines: Vec<Line> = if scrollback {
         let grid = emu.term.grid();
-        (grid.topmost_line().0..=grid.bottommost_line().0).map(Line).collect()
+        (grid.topmost_line().0..=grid.bottommost_line().0)
+            .map(Line)
+            .collect()
     } else {
         viewport_lines(emu).collect()
     };
@@ -656,12 +760,22 @@ fn format_screen(emu: &Emu, scrollback: bool, ansi: bool) -> String {
         let mut wrapped = false;
         for (_, grapheme, cell) in line_cells(emu, line) {
             wrapped = cell.flags.contains(Flags::WRAPLINE);
-            logical.push((grapheme, if ansi { style_of(cell) } else { CellStyle::default() }));
+            logical.push((
+                grapheme,
+                if ansi {
+                    style_of(cell)
+                } else {
+                    CellStyle::default()
+                },
+            ));
         }
         if wrapped {
             continue;
         }
-        while logical.last().is_some_and(|(g, s)| g == " " && *s == CellStyle::default()) {
+        while logical
+            .last()
+            .is_some_and(|(g, s)| g == " " && *s == CellStyle::default())
+        {
             logical.pop();
         }
         let mut current = CellStyle::default();
@@ -725,7 +839,9 @@ pub fn detect_background(screen: &str) -> bool {
     lines[lines.len().saturating_sub(3)..].iter().any(|line| {
         line.split('·').any(|part| {
             let mut words = part.split_whitespace();
-            let count = words.next().is_some_and(|w| w.parse::<u32>().is_ok_and(|n| n > 0));
+            let count = words
+                .next()
+                .is_some_and(|w| w.parse::<u32>().is_ok_and(|n| n > 0));
             let what = words.next().unwrap_or("");
             count
                 && (what.starts_with("shell")
@@ -764,7 +880,12 @@ pub struct Dialog {
 /// text does not, so this has to be read from the live screen.
 pub fn parse_dialog(screen: &str) -> Option<Dialog> {
     let raw: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
-    let lines: Vec<String> = raw.iter().copied().map(clean_dialog_line).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<String> = raw
+        .iter()
+        .copied()
+        .map(clean_dialog_line)
+        .filter(|l| !l.is_empty())
+        .collect();
     if !lines.iter().any(|l| is_dialog_hint(l)) {
         return None;
     }
@@ -783,7 +904,10 @@ fn numbered_dialog(lines: &[String]) -> Option<Dialog> {
             start -= 1;
             continue;
         }
-        if is_dialog_hint(prev) || prev.contains('?') || !parsed[..start - 1].iter().any(|p| p.is_some()) {
+        if is_dialog_hint(prev)
+            || prev.contains('?')
+            || !parsed[..start - 1].iter().any(|p| p.is_some())
+        {
             break;
         }
         start -= 1;
@@ -794,7 +918,10 @@ fn numbered_dialog(lines: &[String]) -> Option<Dialog> {
         .filter_map(|p| p.clone())
         .map(|(selected, label)| DialogOption { label, selected })
         .collect();
-    Some(Dialog { question: question_above(lines, first), options })
+    Some(Dialog {
+        question: question_above(lines, first),
+        options,
+    })
 }
 
 /// Trust-style choices: `❯ No, exit` plus siblings indented to the label column.
@@ -812,15 +939,29 @@ fn plain_dialog(raw: &[&str]) -> Option<Dialog> {
     let options: Vec<DialogOption> = raw[start..=end]
         .iter()
         .map(|line| match plain_marker(line) {
-            Some((_, label)) => DialogOption { label, selected: true },
-            None => DialogOption { label: line.trim().to_string(), selected: false },
+            Some((_, label)) => DialogOption {
+                label,
+                selected: true,
+            },
+            None => DialogOption {
+                label: line.trim().to_string(),
+                selected: false,
+            },
         })
         .collect();
     if options.len() < 2 {
         return None;
     }
-    let above: Vec<String> = raw[..start].iter().copied().map(clean_dialog_line).filter(|l| !l.is_empty()).collect();
-    Some(Dialog { question: question_above(&above, above.len()), options })
+    let above: Vec<String> = raw[..start]
+        .iter()
+        .copied()
+        .map(clean_dialog_line)
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some(Dialog {
+        question: question_above(&above, above.len()),
+        options,
+    })
 }
 
 /// `(display column where the label starts, label)`.
@@ -849,7 +990,11 @@ fn is_plain_choice(line: &str, label_col: usize) -> bool {
         return true;
     }
     let trimmed = line.trim();
-    if trimmed.is_empty() || is_dialog_hint(trimmed) || trimmed.starts_with('/') || trimmed.len() > 80 {
+    if trimmed.is_empty()
+        || is_dialog_hint(trimmed)
+        || trimmed.starts_with('/')
+        || trimmed.len() > 80
+    {
         return false;
     }
     let lead = line.len() - line.trim_start().len();
@@ -881,8 +1026,26 @@ fn clean_dialog_line(line: &str) -> String {
         .trim_matches(|c: char| {
             matches!(
                 c,
-                '│' | '┃' | '║' | '|' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘' | '├'
-                    | '┤' | '┬' | '┴' | '┼' | '─' | '━' | '═' | ' '
+                '│' | '┃'
+                    | '║'
+                    | '|'
+                    | '╭'
+                    | '╮'
+                    | '╰'
+                    | '╯'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '─'
+                    | '━'
+                    | '═'
+                    | ' '
             )
         })
         .trim()
@@ -898,8 +1061,12 @@ fn parse_option(line: &str) -> Option<(bool, String)> {
     if !rest.chars().next()?.is_ascii_digit() {
         return None;
     }
-    let digits_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    let body = rest[digits_end..].strip_prefix('.')?.strip_prefix(|c: char| c.is_whitespace())?;
+    let digits_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let body = rest[digits_end..]
+        .strip_prefix('.')?
+        .strip_prefix(|c: char| c.is_whitespace())?;
     let body = body.trim();
     if body.is_empty() {
         return None;
@@ -924,11 +1091,13 @@ pub fn detect_prompt(screen: &str) -> Option<String> {
         tail.lines()
             .map(str::trim)
             .find(|l| l.starts_with("Do you want") || l.ends_with('?'))
-            .map(|l| l.trim_matches(|c: char| c == '│' || c.is_whitespace()).to_string())
+            .map(|l| {
+                l.trim_matches(|c: char| c == '│' || c.is_whitespace())
+                    .to_string()
+            })
             .or_else(|| Some("Waiting for a choice".into()))
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -951,25 +1120,67 @@ mod tests {
     }
 
     fn key(code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> KeyInput {
-        KeyInput { code, ctrl, alt, shift, sup: false }
+        KeyInput {
+            code,
+            ctrl,
+            alt,
+            shift,
+            sup: false,
+        }
     }
 
     #[test]
     fn encodes_keys() {
         let legacy = TermMode::default();
-        assert_eq!(encode_key(legacy, &key(KeyCode::Char('a'), false, false, false)), b"a");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Char('A'), false, false, true)), b"A");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Char('c'), true, false, false)), b"\x03");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Char('b'), false, true, false)), b"\x1bb");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Enter, false, false, false)), b"\r");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Up, false, false, false)), b"\x1b[A");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Char('é'), false, false, false)), "é".as_bytes());
-        assert_eq!(encode_key(legacy, &key(KeyCode::Backspace, false, false, false)), b"\x7f");
-        assert_eq!(encode_key(legacy, &key(KeyCode::BackTab, false, false, false)), b"\x1b[Z");
-        assert_eq!(encode_key(legacy, &key(KeyCode::Left, true, false, false)), b"\x1b[1;5D");
-        assert_eq!(encode_key(legacy, &key(KeyCode::F(5), false, false, false)), b"\x1b[15~");
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Char('a'), false, false, false)),
+            b"a"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Char('A'), false, false, true)),
+            b"A"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Char('c'), true, false, false)),
+            b"\x03"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Char('b'), false, true, false)),
+            b"\x1bb"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Enter, false, false, false)),
+            b"\r"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Up, false, false, false)),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Char('é'), false, false, false)),
+            "é".as_bytes()
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Backspace, false, false, false)),
+            b"\x7f"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::BackTab, false, false, false)),
+            b"\x1b[Z"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::Left, true, false, false)),
+            b"\x1b[1;5D"
+        );
+        assert_eq!(
+            encode_key(legacy, &key(KeyCode::F(5), false, false, false)),
+            b"\x1b[15~"
+        );
         let app = legacy | TermMode::APP_CURSOR;
-        assert_eq!(encode_key(app, &key(KeyCode::Up, false, false, false)), b"\x1bOA");
+        assert_eq!(
+            encode_key(app, &key(KeyCode::Up, false, false, false)),
+            b"\x1bOA"
+        );
     }
 
     #[test]
@@ -978,11 +1189,26 @@ mod tests {
         emu.vt_write(b"\x1b[>1u");
         let mode = *emu.term.mode();
         assert!(mode.contains(TermMode::DISAMBIGUATE_ESC_CODES));
-        assert_eq!(encode_key(mode, &key(KeyCode::Enter, false, false, true)), b"\x1b[13;2u");
-        assert_eq!(encode_key(mode, &key(KeyCode::Enter, false, false, false)), b"\r");
-        assert_eq!(encode_key(mode, &key(KeyCode::Escape, false, false, false)), b"\x1b[27u");
-        assert_eq!(encode_key(mode, &key(KeyCode::Char('c'), true, false, false)), b"\x1b[99;5u");
-        assert_eq!(encode_key(mode, &key(KeyCode::Char('A'), false, false, true)), b"A");
+        assert_eq!(
+            encode_key(mode, &key(KeyCode::Enter, false, false, true)),
+            b"\x1b[13;2u"
+        );
+        assert_eq!(
+            encode_key(mode, &key(KeyCode::Enter, false, false, false)),
+            b"\r"
+        );
+        assert_eq!(
+            encode_key(mode, &key(KeyCode::Escape, false, false, false)),
+            b"\x1b[27u"
+        );
+        assert_eq!(
+            encode_key(mode, &key(KeyCode::Char('c'), true, false, false)),
+            b"\x1b[99;5u"
+        );
+        assert_eq!(
+            encode_key(mode, &key(KeyCode::Char('A'), false, false, true)),
+            b"A"
+        );
     }
 
     #[test]
@@ -1019,14 +1245,20 @@ mod tests {
         assert_eq!(out.lock().unwrap().as_slice(), b"\x1b[1;1R");
         out.lock().unwrap().clear();
         emu.vt_write(b"\x1b]11;?\x07");
-        assert_eq!(out.lock().unwrap().as_slice(), b"\x1b]11;rgb:2828/2c2c/3434\x07");
+        assert_eq!(
+            out.lock().unwrap().as_slice(),
+            b"\x1b]11;rgb:2828/2c2c/3434\x07"
+        );
     }
 
     #[test]
     fn reports_title() {
         let (mut emu, _) = test_emu();
         emu.vt_write(b"\x1b]0;\xe2\x9c\xb3 Fix bug\x07");
-        assert_eq!(emu.title.take().map(|t| clean_title(&t)).as_deref(), Some("Fix bug"));
+        assert_eq!(
+            emu.title.take().map(|t| clean_title(&t)).as_deref(),
+            Some("Fix bug")
+        );
     }
 
     #[test]
@@ -1037,7 +1269,14 @@ mod tests {
         }
         emu.vt_write(&[b'x'; 45]);
         assert!(viewport_text(&emu).starts_with("line 6\n"));
-        handle(&mut emu, Msg::Scroll { delta: -3, col: 0, row: 0 });
+        handle(
+            &mut emu,
+            Msg::Scroll {
+                delta: -3,
+                col: 0,
+                row: 0,
+            },
+        );
         assert!(snapshot(&emu).scrolled);
         assert!(viewport_text(&emu).starts_with("line 3\n"));
         handle(&mut emu, Msg::ScrollReset);
@@ -1061,7 +1300,10 @@ mod tests {
     #[test]
     fn encodes_paste_and_wheel() {
         assert_eq!(encode_paste("a\nb", false), b"a\rb");
-        assert_eq!(encode_paste("a\x1b[201~b", true), b"\x1b[200~a[201~b\x1b[201~");
+        assert_eq!(
+            encode_paste("a\x1b[201~b", true),
+            b"\x1b[200~a[201~b\x1b[201~"
+        );
         let sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
         assert_eq!(encode_wheel(sgr, -2, 3, 4), b"\x1b[<64;4;5M\x1b[<64;4;5M");
     }
@@ -1078,14 +1320,24 @@ mod tests {
     #[test]
     fn detects_trust_prompt() {
         let screen = "Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit\nEnter to confirm · Esc to exit";
-        assert_eq!(detect_prompt(screen).as_deref(), Some("Folder trust prompt"));
+        assert_eq!(
+            detect_prompt(screen).as_deref(),
+            Some("Folder trust prompt")
+        );
         assert_eq!(detect_prompt("just some output"), None);
         let perm = "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
-        assert_eq!(detect_prompt(perm).as_deref(), Some("Do you want to proceed?"));
+        assert_eq!(
+            detect_prompt(perm).as_deref(),
+            Some("Do you want to proceed?")
+        );
     }
 
     fn labels(dialog: &Dialog) -> Vec<(&str, bool)> {
-        dialog.options.iter().map(|o| (o.label.as_str(), o.selected)).collect()
+        dialog
+            .options
+            .iter()
+            .map(|o| (o.label.as_str(), o.selected))
+            .collect()
     }
 
     #[test]
@@ -1098,17 +1350,27 @@ mod tests {
         let trust = "Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit\nEnter to confirm · Esc to exit";
         let dialog = parse_dialog(trust).unwrap();
         assert_eq!(dialog.question, "Do you trust the files in this folder?");
-        assert_eq!(labels(&dialog), vec![("1. Yes, proceed", true), ("2. No, exit", false)]);
+        assert_eq!(
+            labels(&dialog),
+            vec![("1. Yes, proceed", true), ("2. No, exit", false)]
+        );
 
         let moved = "Do you want to make this edit?\n  1. Yes\n❯ 2. Yes, allow all edits this session\n  3. No\nEsc to cancel";
         let dialog = parse_dialog(moved).unwrap();
         assert_eq!(
             labels(&dialog),
-            vec![("1. Yes", false), ("2. Yes, allow all edits this session", true), ("3. No", false)]
+            vec![
+                ("1. Yes", false),
+                ("2. Yes, allow all edits this session", true),
+                ("3. No", false)
+            ]
         );
 
         let ascii = "Do you want to proceed?\n> 1. Yes\n  2. No\nEnter to confirm";
-        assert_eq!(labels(&parse_dialog(ascii).unwrap()), vec![("1. Yes", true), ("2. No", false)]);
+        assert_eq!(
+            labels(&parse_dialog(ascii).unwrap()),
+            vec![("1. Yes", true), ("2. No", false)]
+        );
     }
 
     #[test]
@@ -1128,7 +1390,11 @@ mod tests {
         assert_eq!(dialog.question, "Do you want to proceed?");
         assert_eq!(
             labels(&dialog),
-            vec![("1. Yes", true), ("2. Yes, and don't ask again", false), ("3. No", false)]
+            vec![
+                ("1. Yes", true),
+                ("2. Yes, and don't ask again", false),
+                ("3. No", false)
+            ]
         );
         assert_eq!(parse_dialog("1. Yes\n2. No\nAll done."), None);
         assert_eq!(parse_dialog("just some output"), None);
@@ -1174,7 +1440,10 @@ mod tests {
         let dialog = parse_dialog(screen).unwrap();
         assert!(dialog.question.contains('?'));
         assert!(dialog.question.to_ascii_lowercase().contains("trust"));
-        assert_eq!(labels(&dialog), vec![("No, exit", true), ("Yes, I trust this folder", false)]);
+        assert_eq!(
+            labels(&dialog),
+            vec![("No, exit", true), ("Yes, I trust this folder", false)]
+        );
 
         let moved = concat!(
             " Quick safety check: Is this a project you created or one you trust? (Like your own code)\n",
@@ -1183,6 +1452,9 @@ mod tests {
             " Enter to confirm · Esc to cancel",
         );
         let dialog = parse_dialog(moved).unwrap();
-        assert_eq!(labels(&dialog), vec![("No, exit", false), ("Yes, I trust this folder", true)]);
+        assert_eq!(
+            labels(&dialog),
+            vec![("No, exit", false), ("Yes, I trust this folder", true)]
+        );
     }
 }

@@ -24,7 +24,11 @@ fn migrations() -> Vec<(&'static str, &'static str)> {
         .files()
         .filter(|f| f.path().extension().is_some_and(|e| e == "sql"))
         .map(|f| {
-            let name = f.path().file_stem().and_then(|s| s.to_str()).expect("UTF-8 migration name");
+            let name = f
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("UTF-8 migration name");
             let sql = f.contents_utf8().expect("UTF-8 migration");
             (name, sql)
         })
@@ -46,7 +50,9 @@ impl Db {
     /// Open (creating if needed) the database at `path` and apply any
     /// pending migrations.
     pub async fn open(path: &Path) -> Result<Db> {
-        let path_str = path.to_str().ok_or_else(|| anyhow!("non-UTF-8 database path {}", path.display()))?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 database path {}", path.display()))?;
         let db = turso::Builder::new_local(path_str)
             .build()
             .await
@@ -59,82 +65,94 @@ impl Db {
 
     async fn migrate(&self) -> Result<()> {
         self.conn
-                .execute(
-                    "CREATE TABLE IF NOT EXISTS _applied_migrations (
+            .execute(
+                "CREATE TABLE IF NOT EXISTS _applied_migrations (
                         name TEXT PRIMARY KEY NOT NULL,
                         applied_at INTEGER NOT NULL
                     )",
-                    (),
-                )
-                .await?;
-            let mut applied = Vec::new();
-            let mut rows = self.conn.query("SELECT name FROM _applied_migrations", ()).await?;
-            while let Some(row) = rows.next().await? {
-                applied.push(row.get::<String>(0)?);
-            }
-            drop(rows);
-
-            for (name, sql) in migrations() {
-                if applied.iter().any(|a| a == name) {
-                    continue;
-                }
-                self.conn.execute("BEGIN", ()).await?;
-                let result = async {
-                    self.conn.execute_batch(sql).await?;
-                    self.conn
-                        .execute(
-                            "INSERT INTO _applied_migrations (name, applied_at) VALUES (?1, ?2)",
-                            (name, paths::now() as i64),
-                        )
-                        .await?;
-                    self.conn.execute("COMMIT", ()).await?;
-                    anyhow::Ok(())
-                }
-                .await;
-                if let Err(e) = result {
-                    let _ = self.conn.execute("ROLLBACK", ()).await;
-                    return Err(e.context(format!("migration {name}")));
-                }
-                eprintln!("[{}] applied migration {name}", paths::now());
-            }
-            Ok(())
-    }
-
-    pub async fn load_sessions(&self) -> Result<Vec<SessionInfo>> {
+                (),
+            )
+            .await?;
+        let mut applied = Vec::new();
         let mut rows = self
-                .conn
-                .query(format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY id"), ())
-                .await?;
-            let mut infos = Vec::new();
-            while let Some(row) = rows.next().await? {
-                let id: String = row.get(0)?;
-                let info = session_from_row(&row).with_context(|| format!("session {id}"))?;
-                infos.push(info);
-            }
-            Ok(infos)
-    }
+            .conn
+            .query("SELECT name FROM _applied_migrations", ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            applied.push(row.get::<String>(0)?);
+        }
+        drop(rows);
 
-    /// Replace the stored sessions with `infos`, atomically.
-    pub async fn save_sessions<'a>(&self, infos: impl IntoIterator<Item = &'a SessionInfo>) -> Result<()> {
-        let insert = format!(
-            "INSERT INTO sessions ({SESSION_COLUMNS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
-        );
-        let rows = infos.into_iter().map(session_params).collect::<Result<Vec<_>>>()?;
-        self.conn.execute("BEGIN", ()).await?;
+        for (name, sql) in migrations() {
+            if applied.iter().any(|a| a == name) {
+                continue;
+            }
+            self.conn.execute("BEGIN", ()).await?;
             let result = async {
-                self.conn.execute("DELETE FROM sessions", ()).await?;
-                for params in rows {
-                    self.conn.execute(&insert, params).await?;
-                }
+                self.conn.execute_batch(sql).await?;
+                self.conn
+                    .execute(
+                        "INSERT INTO _applied_migrations (name, applied_at) VALUES (?1, ?2)",
+                        (name, paths::now() as i64),
+                    )
+                    .await?;
                 self.conn.execute("COMMIT", ()).await?;
                 anyhow::Ok(())
             }
             .await;
-            if result.is_err() {
+            if let Err(e) = result {
                 let _ = self.conn.execute("ROLLBACK", ()).await;
+                return Err(e.context(format!("migration {name}")));
             }
-            result
+            eprintln!("[{}] applied migration {name}", paths::now());
+        }
+        Ok(())
+    }
+
+    pub async fn load_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let mut rows = self
+            .conn
+            .query(
+                format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY id"),
+                (),
+            )
+            .await?;
+        let mut infos = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            let info = session_from_row(&row).with_context(|| format!("session {id}"))?;
+            infos.push(info);
+        }
+        Ok(infos)
+    }
+
+    /// Replace the stored sessions with `infos`, atomically.
+    pub async fn save_sessions<'a>(
+        &self,
+        infos: impl IntoIterator<Item = &'a SessionInfo>,
+    ) -> Result<()> {
+        let insert = format!(
+            "INSERT INTO sessions ({SESSION_COLUMNS}) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+        );
+        let rows = infos
+            .into_iter()
+            .map(session_params)
+            .collect::<Result<Vec<_>>>()?;
+        self.conn.execute("BEGIN", ()).await?;
+        let result = async {
+            self.conn.execute("DELETE FROM sessions", ()).await?;
+            for params in rows {
+                self.conn.execute(&insert, params).await?;
+            }
+            self.conn.execute("COMMIT", ()).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.conn.execute("ROLLBACK", ()).await;
+        }
+        result
     }
 }
 
@@ -165,7 +183,8 @@ fn session_params(info: &SessionInfo) -> Result<Vec<Value>> {
         opt_text(&info.title),
         Value::Integer(info.created_at as i64),
         Value::Integer(info.updated_at as i64),
-        info.exit_code.map_or(Value::Null, |c| Value::Integer(c.into())),
+        info.exit_code
+            .map_or(Value::Null, |c| Value::Integer(c.into())),
         Value::Integer(info.turns as i64),
         opt_text(&info.last_message),
         Value::Text(serde_json::to_string(&info.claude_args)?),
@@ -207,7 +226,8 @@ mod tests {
     use crate::protocol::BackgroundTask;
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("claude-mux-db-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("claude-mux-db-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("state.db")
@@ -230,7 +250,11 @@ mod tests {
             last_message: None,
             claude_args: vec!["--model".into(), "opus".into()],
             auto_trust: true,
-            background: vec![BackgroundTask { id: "b1".into(), kind: "shell".into(), description: "npm test".into() }],
+            background: vec![BackgroundTask {
+                id: "b1".into(),
+                kind: "shell".into(),
+                description: "npm test".into(),
+            }],
             asleep: true,
             continued_as: Some("c3".into()),
         }
@@ -241,7 +265,9 @@ mod tests {
         let path = temp_db_path("roundtrip");
         {
             let db = Db::open(&path).await.unwrap();
-            db.save_sessions(&[sample("a1"), sample("b2")]).await.unwrap();
+            db.save_sessions(&[sample("a1"), sample("b2")])
+                .await
+                .unwrap();
             db.save_sessions(&[sample("b2")]).await.unwrap();
         }
         // Reopening must not re-run migrations (CREATE TABLE would fail).

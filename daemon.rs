@@ -11,8 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -204,7 +204,13 @@ pub async fn run() -> Result<Started> {
         .write(true)
         .open(paths::home().join("daemon.lock"))
         .context("open daemon lock file")?;
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if unsafe {
+        libc::flock(
+            std::os::fd::AsRawFd::as_raw_fd(&lock),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    } != 0
+    {
         return Ok(Started::AlreadyRunning);
     }
     std::mem::forget(lock);
@@ -216,12 +222,19 @@ pub async fn run() -> Result<Started> {
     tokio::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
         .await
         .with_context(|| format!("restrict socket permissions on {}", sock.display()))?;
-    eprintln!("[{}] claude-mux daemon listening on {}", paths::now(), sock.display());
+    eprintln!(
+        "[{}] claude-mux daemon listening on {}",
+        paths::now(),
+        sock.display()
+    );
 
     let (version_tx, _) = watch::channel(1);
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<(String, TermEvent)>();
     let daemon: Shared = Arc::new(Daemon {
-        inner: AsyncMutex::new(Inner { sessions, version: 1 }),
+        inner: AsyncMutex::new(Inner {
+            sessions,
+            version: 1,
+        }),
         db,
         version_tx,
         events_tx,
@@ -305,7 +318,11 @@ impl Daemon {
 
     /// Wake every watcher (e.g. a subscribed client went away).
     fn poke_watchers(&self) {
-        let version = self.inner.try_lock().map(|inner| inner.version).unwrap_or(0);
+        let version = self
+            .inner
+            .try_lock()
+            .map(|inner| inner.version)
+            .unwrap_or(0);
         let _ = self.version_tx.send(version);
     }
 }
@@ -322,7 +339,10 @@ fn set_status(s: &mut Session, status: Status, detail: Option<String>) {
 // ---------------------------------------------------------------------------
 // Connections
 
-async fn write_line<T: serde::Serialize>(w: &mut (impl tokio::io::AsyncWrite + Unpin), msg: &T) -> Result<()> {
+async fn write_line<T: serde::Serialize>(
+    w: &mut (impl tokio::io::AsyncWrite + Unpin),
+    msg: &T,
+) -> Result<()> {
     let mut line = serde_json::to_vec(msg)?;
     line.push(b'\n');
     w.write_all(&line).await?;
@@ -346,19 +366,29 @@ async fn handle_conn(d: &Shared, stream: tokio::net::UnixStream) -> Result<()> {
             Ok(())
         }
         req => {
-            let resp = handle_request(d, req).await.unwrap_or_else(|e| Response::Error { message: format!("{e:#}") });
+            let resp = handle_request(d, req)
+                .await
+                .unwrap_or_else(|e| Response::Error {
+                    message: format!("{e:#}"),
+                });
             write_line(&mut writer, &resp).await
         }
     }
 }
 
 fn session_mut<'a>(inner: &'a mut Inner, id: &str) -> Result<&'a mut Session> {
-    inner.sessions.get_mut(id).ok_or_else(|| anyhow!("no session with id '{id}'"))
+    inner
+        .sessions
+        .get_mut(id)
+        .ok_or_else(|| anyhow!("no session with id '{id}'"))
 }
 
 /// The session running the claude process `process`.
 fn session_of<'a>(inner: &'a mut Inner, process: &str) -> Option<&'a mut Session> {
-    inner.sessions.values_mut().find(|s| s.process.as_deref() == Some(process))
+    inner
+        .sessions
+        .values_mut()
+        .find(|s| s.process.as_deref() == Some(process))
 }
 
 /// Why a session can't take input, pointing at the session that took over
@@ -366,15 +396,25 @@ fn session_of<'a>(inner: &'a mut Inner, process: &str) -> Option<&'a mut Session
 fn not_running(info: &SessionInfo) -> anyhow::Error {
     match &info.continued_as {
         Some(next) if !info.status.is_live() => {
-            anyhow!("session {} was cleared; it continues as {}", info.short_id(), short_id(next))
+            anyhow!(
+                "session {} was cleared; it continues as {}",
+                info.short_id(),
+                short_id(next)
+            )
         }
-        _ => anyhow!("session {} is {}; resume it first", info.short_id(), info.status.label()),
+        _ => anyhow!(
+            "session {} is {}; resume it first",
+            info.short_id(),
+            info.status.label()
+        ),
     }
 }
 
 async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
     match req {
-        Request::Ping => Ok(Response::Pong { version: env!("CARGO_PKG_VERSION").into() }),
+        Request::Ping => Ok(Response::Pong {
+            version: env!("CARGO_PKG_VERSION").into(),
+        }),
         Request::Create(c) => {
             let info = create(d, c).await?;
             Ok(Response::Session { session: info })
@@ -403,14 +443,28 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             d.touch(&mut inner).await;
             Ok(Response::Session { session: info })
         }
-        Request::Wait { ids, any, timeout_ms, turn } => wait(d, ids, any, timeout_ms, turn).await,
+        Request::Wait {
+            ids,
+            any,
+            timeout_ms,
+            turn,
+        } => wait(d, ids, any, timeout_ms, turn).await,
         Request::List => {
             let inner = d.lock().await;
-            Ok(Response::Sessions { sessions: inner.sessions.values().map(|s| s.info.clone()).collect() })
+            Ok(Response::Sessions {
+                sessions: inner.sessions.values().map(|s| s.info.clone()).collect(),
+            })
         }
         Request::Get { id } => {
             let inner = d.lock().await;
-            Ok(Response::Session { session: inner.sessions.get(&id).ok_or_else(|| anyhow!("no session with id '{id}'"))?.info.clone() })
+            Ok(Response::Session {
+                session: inner
+                    .sessions
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("no session with id '{id}'"))?
+                    .info
+                    .clone(),
+            })
         }
         Request::Peek { id, ansi } => {
             let term = {
@@ -418,7 +472,10 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
                 let s = session_mut(&mut inner, &id)?;
                 s.term.clone().ok_or_else(|| not_running(&s.info))?
             };
-            let text = term.text(false, ansi).await.ok_or_else(|| anyhow!("terminal did not respond"))?;
+            let text = term
+                .text(false, ansi)
+                .await
+                .ok_or_else(|| anyhow!("terminal did not respond"))?;
             Ok(Response::Text { text })
         }
         Request::Kill { id } => {
@@ -429,7 +486,11 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
                 let _ = p.killer.kill();
             } else if s.info.asleep {
                 s.info.asleep = false;
-                set_status(s, Status::Stopped, Some("killed; resume to continue".into()));
+                set_status(
+                    s,
+                    Status::Stopped,
+                    Some("killed; resume to continue".into()),
+                );
             }
             s.queue.clear();
             s.info.queued = 0;
@@ -439,7 +500,10 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
         }
         Request::Remove { id } => {
             let mut inner = d.lock().await;
-            let mut s = inner.sessions.remove(&id).ok_or_else(|| anyhow!("no session with id '{id}'"))?;
+            let mut s = inner
+                .sessions
+                .remove(&id)
+                .ok_or_else(|| anyhow!("no session with id '{id}'"))?;
             if let Some(p) = s.proc.as_mut() {
                 let _ = p.killer.kill();
             }
@@ -453,7 +517,9 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
         Request::Describe { id, description } => {
             let mut inner = d.lock().await;
             let s = session_mut(&mut inner, &id)?;
-            s.info.description = description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+            s.info.description = description
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty());
             let info = s.info.clone();
             d.touch(&mut inner).await;
             Ok(Response::Session { session: info })
@@ -486,7 +552,11 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
             tokio::time::sleep(Duration::from_millis(600)).await;
             Ok(Response::Ok)
         }
-        Request::Hook { process, event, payload } => {
+        Request::Hook {
+            process,
+            event,
+            payload,
+        } => {
             on_hook(d, &process, &event, payload).await;
             Ok(Response::Ok)
         }
@@ -494,7 +564,13 @@ async fn handle_request(d: &Shared, req: Request) -> Result<Response> {
     }
 }
 
-async fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, turn: bool) -> Result<Response> {
+async fn wait(
+    d: &Shared,
+    ids: Vec<String>,
+    any: bool,
+    timeout_ms: Option<u64>,
+    turn: bool,
+) -> Result<Response> {
     if ids.is_empty() {
         bail!("no session ids given");
     }
@@ -522,16 +598,28 @@ async fn wait(d: &Shared, ids: Vec<String>, any: bool, timeout_ms: Option<u64>, 
             }
             infos
         };
-        let done = |s: Status| if turn { s.is_turn_over() } else { s.is_settled() };
+        let done = |s: Status| {
+            if turn {
+                s.is_turn_over()
+            } else {
+                s.is_settled()
+            }
+        };
         let settled = infos.iter().filter(|i| done(i.effective_status())).count();
         if (any && settled > 0) || settled == infos.len() {
-            return Ok(Response::Wait { sessions: infos, timed_out: false });
+            return Ok(Response::Wait {
+                sessions: infos,
+                timed_out: false,
+            });
         }
         let wait_for = match deadline {
             Some(dl) => {
                 let now = Instant::now();
                 if now >= dl {
-                    return Ok(Response::Wait { sessions: infos, timed_out: true });
+                    return Ok(Response::Wait {
+                        sessions: infos,
+                        timed_out: true,
+                    });
                 }
                 (dl - now).min(Duration::from_secs(5))
             }
@@ -558,7 +646,10 @@ async fn create(d: &Shared, c: CreateRequest) -> Result<SessionInfo> {
     let now = paths::now();
     let info = SessionInfo {
         id: id.clone(),
-        description: c.description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
+        description: c
+            .description
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
         cwd: c.cwd,
         prompt: c.prompt.clone(),
         status: Status::Starting,
@@ -639,7 +730,12 @@ fn claude_bin() -> String {
 fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     let (cols, rows) = s.size;
     let pty = native_pty_system()
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .context("failed to open a pty")?;
 
     let mut cmd = CommandBuilder::new(claude_bin());
@@ -670,7 +766,10 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
     cmd.env("CLAUDE_MUX_HOME", paths::home());
     cmd.env("CLAUDE_MUX_SOCKET", paths::socket());
     // Make `claude-mux` itself available so sessions can orchestrate others.
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut parts = vec![dir];
         parts.extend(std::env::split_paths(&path));
@@ -679,7 +778,10 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
         }
     }
 
-    let mut child = pty.slave.spawn_command(cmd).context("failed to start claude (is it on PATH?)")?;
+    let mut child = pty
+        .slave
+        .spawn_command(cmd)
+        .context("failed to start claude (is it on PATH?)")?;
     drop(pty.slave);
     let killer = child.clone_killer();
     let mut reader = pty.master.try_clone_reader()?;
@@ -720,7 +822,10 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
         });
     }
 
-    s.proc = Some(Proc { master: pty.master, killer });
+    s.proc = Some(Proc {
+        master: pty.master,
+        killer,
+    });
     s.process = Some(process);
     s.term = Some(term);
     Ok(())
@@ -728,7 +833,9 @@ fn spawn_claude(d: &Shared, s: &mut Session, resume: bool) -> Result<()> {
 
 async fn on_process_exit(d: Shared, process: String, code: Option<i32>) {
     let mut inner = d.lock().await;
-    let Some(s) = session_of(&mut inner, &process) else { return };
+    let Some(s) = session_of(&mut inner, &process) else {
+        return;
+    };
     if std::mem::take(&mut s.falling_asleep) && !s.killed {
         s.info.asleep = true;
         s.awaiting_submit = None;
@@ -752,9 +859,17 @@ async fn on_process_exit(d: Shared, process: String, code: Option<i32>) {
     s.awaiting_submit = None;
     s.screen_prompt = None;
     if d.shutting_down.load(Ordering::SeqCst) {
-        set_status(s, Status::Stopped, Some("daemon shut down; resume to continue".into()));
+        set_status(
+            s,
+            Status::Stopped,
+            Some("daemon shut down; resume to continue".into()),
+        );
     } else if std::mem::take(&mut s.killed) {
-        set_status(s, Status::Stopped, Some("killed; resume to continue".into()));
+        set_status(
+            s,
+            Status::Stopped,
+            Some("killed; resume to continue".into()),
+        );
     } else {
         set_status(s, Status::Exited, code.map(|c| format!("exit code {c}")));
     }
@@ -784,7 +899,11 @@ async fn shutdown(d: &Shared) {
     let mut inner = d.lock().await;
     for s in inner.sessions.values_mut() {
         if s.running() {
-            set_status(s, Status::Stopped, Some("daemon shut down; resume to continue".into()));
+            set_status(
+                s,
+                Status::Stopped,
+                Some("daemon shut down; resume to continue".into()),
+            );
         }
     }
     d.touch(&mut inner).await;
@@ -799,7 +918,11 @@ async fn shutdown(d: &Shared) {
 /// Paste the message, then press Enter once claude has taken the paste.
 fn type_message(s: &mut Session, message: String) {
     let Some(term) = s.term.clone() else { return };
-    let grace = if message.trim_start().starts_with('/') { Duration::from_secs(4) } else { Duration::from_secs(15) };
+    let grace = if message.trim_start().starts_with('/') {
+        Duration::from_secs(4)
+    } else {
+        Duration::from_secs(15)
+    };
     s.awaiting_submit = Some((Instant::now(), grace));
     if matches!(s.info.status, Status::Idle | Status::Background) {
         set_status(s, Status::Working, Some("message sent".into()));
@@ -893,7 +1016,11 @@ async fn ticker(d: Shared) {
 
 /// Idle, or Background if the last turn left tasks running.
 fn resting_status(s: &Session) -> Status {
-    if s.info.background.is_empty() { Status::Idle } else { Status::Background }
+    if s.info.background.is_empty() {
+        Status::Idle
+    } else {
+        Status::Background
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +1028,9 @@ fn resting_status(s: &Session) -> Status {
 
 async fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
     let mut inner = d.lock().await;
-    let Some(s) = session_of(&mut inner, process) else { return };
+    let Some(s) = session_of(&mut inner, process) else {
+        return;
+    };
     match ev {
         TermEvent::Dirty => {
             s.screen_gen += 1;
@@ -910,13 +1039,17 @@ async fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
         TermEvent::Title(title) => {
             // Keep the last meaningful title: claude resets it on exit and
             // uses its own name before it has a task summary.
-            if !title.is_empty() && title != "Claude Code" && s.info.title.as_deref() != Some(&title) {
+            if !title.is_empty()
+                && title != "Claude Code"
+                && s.info.title.as_deref() != Some(&title)
+            {
                 s.info.title = Some(title);
                 d.touch(&mut inner).await;
             }
         }
         TermEvent::Background(running) => {
-            s.background_cleared = (!running && s.info.status == Status::Background).then(Instant::now);
+            s.background_cleared =
+                (!running && s.info.status == Status::Background).then(Instant::now);
         }
         TermEvent::Prompt(prompt) => {
             if s.info.auto_trust && prompt.as_deref() == Some(TRUST_PROMPT) {
@@ -937,7 +1070,11 @@ async fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
                 }
                 None if s.info.status == Status::NeedsInput => {
                     let back = s.status_before_prompt.take().unwrap_or(Status::Working);
-                    let back = if matches!(back, Status::Idle | Status::Background) { back } else { Status::Working };
+                    let back = if matches!(back, Status::Idle | Status::Background) {
+                        back
+                    } else {
+                        Status::Working
+                    };
                     set_status(s, back, None);
                     // Timers were paused while the dialog was up.
                     if let Some((_, grace)) = s.awaiting_submit {
@@ -954,12 +1091,22 @@ async fn on_term_event(d: &Shared, process: &str, ev: TermEvent) {
 
 /// Move the dialog selection onto "Yes, I trust this folder" and confirm.
 async fn accept_trust(term: TermHandle) {
-    let Some(text) = term.text(false, false).await else { return };
+    let Some(text) = term.text(false, false).await else {
+        return;
+    };
     let lines: Vec<&str> = text.lines().collect();
     let selected = lines.iter().position(|l| l.trim_start().starts_with('❯'));
-    let yes = lines.iter().position(|l| l.contains("Yes, I trust") || l.contains("Yes, proceed"));
-    let (Some(selected), Some(yes)) = (selected, yes) else { return };
-    let code = if yes > selected { KeyCode::Down } else { KeyCode::Up };
+    let yes = lines
+        .iter()
+        .position(|l| l.contains("Yes, I trust") || l.contains("Yes, proceed"));
+    let (Some(selected), Some(yes)) = (selected, yes) else {
+        return;
+    };
+    let code = if yes > selected {
+        KeyCode::Down
+    } else {
+        KeyCode::Up
+    };
     for _ in 0..yes.abs_diff(selected) {
         term.key(KeyInput::plain(code.clone()));
     }
@@ -971,9 +1118,15 @@ async fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
     if std::env::var_os("CLAUDE_MUX_DEBUG").is_some() {
         eprintln!("[{}] hook {process} {event} {payload}", paths::now());
     }
-    let last_message = if event == "Stop" { hooks::last_assistant_message(&payload).await } else { None };
+    let last_message = if event == "Stop" {
+        hooks::last_assistant_message(&payload).await
+    } else {
+        None
+    };
     let mut inner = d.lock().await;
-    let Some(mut id) = session_of(&mut inner, process).map(|s| s.info.id.clone()) else { return };
+    let Some(mut id) = session_of(&mut inner, process).map(|s| s.info.id.clone()) else {
+        return;
+    };
     if let Some(conversation) = payload.get("session_id").and_then(Value::as_str)
         && !conversation.is_empty()
         && conversation != id
@@ -983,7 +1136,9 @@ async fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
             id = conversation.to_string();
         }
     }
-    let Some(s) = inner.sessions.get_mut(&id) else { return };
+    let Some(s) = inner.sessions.get_mut(&id) else {
+        return;
+    };
     if !s.info.status.is_live() {
         return;
     }
@@ -1011,8 +1166,14 @@ async fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
             }
         }
         "Notification" => {
-            let kind = payload.get("notification_type").and_then(Value::as_str).unwrap_or("");
-            let message = payload.get("message").and_then(Value::as_str).map(str::to_string);
+            let kind = payload
+                .get("notification_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let is_permission = kind == "permission_prompt"
                 || message.as_deref().is_some_and(|m| m.contains("permission"));
             if is_permission {
@@ -1020,7 +1181,10 @@ async fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
                     s.status_before_prompt = Some(s.info.status);
                 }
                 set_status(s, Status::NeedsInput, message);
-            } else if kind == "idle_prompt" && s.info.status == Status::Working && s.awaiting_submit.is_none() {
+            } else if kind == "idle_prompt"
+                && s.info.status == Status::Working
+                && s.awaiting_submit.is_none()
+            {
                 set_status(s, resting_status(s), background_detail(&s.info.background));
             }
         }
@@ -1058,10 +1222,16 @@ async fn on_hook(d: &Shared, process: &str, event: &str, payload: Value) {
 /// resume. Returns false, changing nothing, if the conversation is already
 /// running in another process.
 fn switch_conversation(inner: &mut Inner, id: &str, conversation: &str, source: &str) -> bool {
-    if inner.sessions.get(conversation).is_some_and(|s| s.proc.is_some()) {
+    if inner
+        .sessions
+        .get(conversation)
+        .is_some_and(|s| s.proc.is_some())
+    {
         return false;
     }
-    let Some(mut s) = inner.sessions.remove(id) else { return false };
+    let Some(mut s) = inner.sessions.remove(id) else {
+        return false;
+    };
     let now = paths::now();
     let mut info = match inner.sessions.remove(conversation) {
         Some(known) => known.info,
@@ -1135,17 +1305,32 @@ fn flush_wake_input(s: &mut Session) {
 
 /// Background tasks the Stop hook reports as still running.
 fn running_background_tasks(payload: &Value) -> Vec<BackgroundTask> {
-    let Some(tasks) = payload.get("background_tasks").and_then(Value::as_array) else { return Vec::new() };
+    let Some(tasks) = payload.get("background_tasks").and_then(Value::as_array) else {
+        return Vec::new();
+    };
     let field = |t: &Value, k: &str| t.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     tasks
         .iter()
-        .filter(|t| matches!(t.get("status").and_then(Value::as_str), Some("running" | "pending") | None))
+        .filter(|t| {
+            matches!(
+                t.get("status").and_then(Value::as_str),
+                Some("running" | "pending") | None
+            )
+        })
         .map(|t| {
             let description = field(t, "description");
             BackgroundTask {
                 id: field(t, "id"),
-                kind: t.get("type").and_then(Value::as_str).unwrap_or("task").to_string(),
-                description: if description.is_empty() { field(t, "command") } else { description },
+                kind: t
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("task")
+                    .to_string(),
+                description: if description.is_empty() {
+                    field(t, "command")
+                } else {
+                    description
+                },
             }
         })
         .collect()
@@ -1154,7 +1339,11 @@ fn running_background_tasks(payload: &Value) -> Vec<BackgroundTask> {
 /// e.g. "1 shell running: Run the test suite".
 fn background_detail(tasks: &[BackgroundTask]) -> Option<String> {
     let first = tasks.first()?;
-    let kind = if tasks.iter().all(|t| t.kind == first.kind) { first.kind.as_str() } else { "task" };
+    let kind = if tasks.iter().all(|t| t.kind == first.kind) {
+        first.kind.as_str()
+    } else {
+        "task"
+    };
     let plural = if tasks.len() == 1 { "" } else { "s" };
     let mut detail = format!("{} {kind}{plural} running", tasks.len());
     if !first.description.is_empty() {
@@ -1179,10 +1368,18 @@ mod tests {
             { "id": "c", "type": "shell", "status": "running", "command": "sleep 5" },
         ]});
         let tasks = running_background_tasks(&payload);
-        assert_eq!(tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        assert_eq!(
+            tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
         assert_eq!(tasks[1].description, "sleep 5");
-        assert_eq!(background_detail(&tasks).as_deref(), Some("2 shells running: Run tests (+1)"));
-        assert!(running_background_tasks(&serde_json::json!({ "background_tasks": [] })).is_empty());
+        assert_eq!(
+            background_detail(&tasks).as_deref(),
+            Some("2 shells running: Run tests (+1)")
+        );
+        assert!(
+            running_background_tasks(&serde_json::json!({ "background_tasks": [] })).is_empty()
+        );
         assert!(running_background_tasks(&serde_json::json!({})).is_empty());
     }
 
@@ -1212,7 +1409,13 @@ mod tests {
     }
 
     fn inner(sessions: Vec<Session>) -> Inner {
-        Inner { sessions: sessions.into_iter().map(|s| (s.info.id.clone(), s)).collect(), version: 0 }
+        Inner {
+            sessions: sessions
+                .into_iter()
+                .map(|s| (s.info.id.clone(), s))
+                .collect(),
+            version: 0,
+        }
     }
 
     #[test]
@@ -1252,7 +1455,10 @@ mod tests {
         let mut inner = inner(vec![first, session("a", 0)]);
         assert!(switch_conversation(&mut inner, "a", "b", "clear"));
         assert!(!inner.sessions.contains_key("a"));
-        assert_eq!(inner.sessions["first"].info.continued_as.as_deref(), Some("b"));
+        assert_eq!(
+            inner.sessions["first"].info.continued_as.as_deref(),
+            Some("b")
+        );
         assert_eq!(inner.sessions["b"].process.as_deref(), Some("proc-a"));
     }
 
@@ -1272,7 +1478,10 @@ mod tests {
         assert_eq!(k.info.status, Status::Idle);
         assert_eq!(k.info.continued_as, None);
         assert!(k.resumable);
-        assert_eq!(inner.sessions["a"].info.status_detail.as_deref(), Some("switched to k"));
+        assert_eq!(
+            inner.sessions["a"].info.status_detail.as_deref(),
+            Some("switched to k")
+        );
     }
 }
 
@@ -1285,7 +1494,11 @@ struct Watch {
     dirty: bool,
 }
 
-async fn subscribe(d: &Shared, reader: BufReader<OwnedReadHalf>, mut writer: OwnedWriteHalf) -> Result<()> {
+async fn subscribe(
+    d: &Shared,
+    reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+) -> Result<()> {
     let watch = Arc::new(Mutex::new(Watch::default()));
     let alive = Arc::new(AtomicBool::new(true));
 
@@ -1296,7 +1509,9 @@ async fn subscribe(d: &Shared, reader: BufReader<OwnedReadHalf>, mut writer: Own
         tokio::spawn(async move {
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(ev) = serde_json::from_str::<ClientEvent>(&line) else { continue };
+                let Ok(ev) = serde_json::from_str::<ClientEvent>(&line) else {
+                    continue;
+                };
                 client_event(&d, &watch, ev).await;
             }
             alive.store(false, Ordering::SeqCst);
@@ -1314,10 +1529,9 @@ async fn subscribe(d: &Shared, reader: BufReader<OwnedReadHalf>, mut writer: Own
             let inner = d.lock().await;
             let w = watch.lock().unwrap().clone();
             let stale_screen = |inner: &Inner| match &w.id {
-                Some(id) => inner
-                    .sessions
-                    .get(id)
-                    .is_some_and(|s| w.dirty || sent_screen.as_ref() != Some(&(id.clone(), s.screen_gen))),
+                Some(id) => inner.sessions.get(id).is_some_and(|s| {
+                    w.dirty || sent_screen.as_ref() != Some(&(id.clone(), s.screen_gen))
+                }),
                 None => false,
             };
             if inner.version == sent_version && !stale_screen(&inner) {
@@ -1330,7 +1544,11 @@ async fn subscribe(d: &Shared, reader: BufReader<OwnedReadHalf>, mut writer: Own
             }
             let sessions = (inner.version != sent_version).then(|| {
                 sent_version = inner.version;
-                inner.sessions.values().map(|s| s.info.clone()).collect::<Vec<_>>()
+                inner
+                    .sessions
+                    .values()
+                    .map(|s| s.info.clone())
+                    .collect::<Vec<_>>()
             });
             let w = watch.lock().unwrap().clone();
             let job = w.id.as_ref().and_then(|id| {
@@ -1349,7 +1567,14 @@ async fn subscribe(d: &Shared, reader: BufReader<OwnedReadHalf>, mut writer: Own
                 Some(term) => term.snapshot().await.unwrap_or_default(),
                 None => Default::default(),
             };
-            write_line(&mut writer, &StreamEvent::Screen { id: id.clone(), screen }).await?;
+            write_line(
+                &mut writer,
+                &StreamEvent::Screen {
+                    id: id.clone(),
+                    screen,
+                },
+            )
+            .await?;
             sent_screen = Some((id, generation));
             // Cap the frame rate; output arriving meanwhile is coalesced.
             if let Some(rest) = frame.checked_sub(started.elapsed()) {
@@ -1370,15 +1595,23 @@ async fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
             if let Some(id) = &id {
                 let mut inner = d.lock().await;
                 if let Some(s) = inner.sessions.get_mut(id)
-                    && cols > 0 && rows > 0 && s.size != (cols, rows) {
-                        s.size = (cols, rows);
-                        if let Some(p) = &s.proc {
-                            let _ = p.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-                        }
-                        if let Some(t) = &s.term {
-                            t.resize(cols, rows);
-                        }
+                    && cols > 0
+                    && rows > 0
+                    && s.size != (cols, rows)
+                {
+                    s.size = (cols, rows);
+                    if let Some(p) = &s.proc {
+                        let _ = p.master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
                     }
+                    if let Some(t) = &s.term {
+                        t.resize(cols, rows);
+                    }
+                }
             }
             let mut w = watch.lock().unwrap();
             w.id = id;
@@ -1396,7 +1629,12 @@ async fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
                 t.paste(text);
             }
         }
-        ClientEvent::Scroll { id, delta, col, row } => {
+        ClientEvent::Scroll {
+            id,
+            delta,
+            col,
+            row,
+        } => {
             if let Some(t) = term_of(d, &id).await {
                 t.scroll(delta, col, row);
             }

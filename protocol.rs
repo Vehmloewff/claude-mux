@@ -221,13 +221,26 @@ pub enum Request {
 #[allow(clippy::large_enum_variant, reason = "short-lived messages")]
 pub enum Response {
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Answer to `Ping`: the daemon's claude-mux version.
-    Pong { version: String },
-    Session { session: SessionInfo },
-    Sessions { sessions: Vec<SessionInfo> },
-    Text { text: String },
-    Wait { sessions: Vec<SessionInfo>, timed_out: bool },
+    Pong {
+        version: String,
+    },
+    Session {
+        session: SessionInfo,
+    },
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    Text {
+        text: String,
+    },
+    Wait {
+        sessions: Vec<SessionInfo>,
+        timed_out: bool,
+    },
 }
 
 /// Messages a subscribed client (`manage`) sends to the daemon.
@@ -235,12 +248,29 @@ pub enum Response {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
     /// Watch a session's screen at the given size (None stops watching).
-    Watch { id: Option<String>, cols: u16, rows: u16 },
-    Key { id: String, key: KeyInput },
-    Paste { id: String, text: String },
+    Watch {
+        id: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    Key {
+        id: String,
+        key: KeyInput,
+    },
+    Paste {
+        id: String,
+        text: String,
+    },
     /// Scroll the viewport (negative = up), or forward wheel to the app.
-    Scroll { id: String, delta: i32, col: u16, row: u16 },
-    ScrollReset { id: String },
+    Scroll {
+        id: String,
+        delta: i32,
+        col: u16,
+        row: u16,
+    },
+    ScrollReset {
+        id: String,
+    },
 }
 
 /// Messages the daemon pushes to a subscribed client.
@@ -339,7 +369,13 @@ pub enum Color {
 
 impl KeyInput {
     pub fn plain(code: KeyCode) -> Self {
-        KeyInput { code, shift: false, ctrl: false, alt: false, sup: false }
+        KeyInput {
+            code,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            sup: false,
+        }
     }
 
     /// Parse names like `enter`, `esc`, `down`, `ctrl-c`, `alt-b`, `y`.
@@ -348,11 +384,12 @@ impl KeyInput {
         let mut rest = spec;
         loop {
             let lower = rest.to_ascii_lowercase();
-            let Some((prefix, tail)) = ["ctrl-", "c-", "alt-", "m-", "shift-", "s-", "super-", "cmd-"]
-                .iter()
-                .find(|p| lower.starts_with(**p) && rest.len() > p.len())
-                .map(|p| (*p, &rest[p.len()..]))
-            else {
+            let Some((prefix, tail)) = [
+                "ctrl-", "c-", "alt-", "m-", "shift-", "s-", "super-", "cmd-",
+            ]
+            .iter()
+            .find(|p| lower.starts_with(**p) && rest.len() > p.len())
+            .map(|p| (*p, &rest[p.len()..])) else {
                 break;
             };
             match prefix {
@@ -399,8 +436,14 @@ mod tests {
 
     #[test]
     fn parses_keys() {
-        assert_eq!(KeyInput::parse("enter"), Some(KeyInput::plain(KeyCode::Enter)));
-        assert_eq!(KeyInput::parse("y"), Some(KeyInput::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            KeyInput::parse("enter"),
+            Some(KeyInput::plain(KeyCode::Enter))
+        );
+        assert_eq!(
+            KeyInput::parse("y"),
+            Some(KeyInput::plain(KeyCode::Char('y')))
+        );
         let c = KeyInput::parse("ctrl-c").unwrap();
         assert!(c.ctrl && c.code == KeyCode::Char('c'));
         let sa = KeyInput::parse("shift-alt-tab").unwrap();
