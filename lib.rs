@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod db;
 pub mod hooks;
 pub mod manage;
+pub mod messages;
 pub mod paths;
 pub mod protocol;
 pub mod term;

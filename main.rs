@@ -3,8 +3,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
+use claude_mux::messages::{self, Message, Transcript, format_duration};
 use claude_mux::paths;
 use claude_mux::protocol::{
     self, CreateRequest, KeyInput, Request, Response, SessionInfo, Status, short_id,
@@ -88,7 +89,7 @@ ANSWERING
 
 OUTPUT AND EXIT CODES
   Results go to stdout; notes and errors go to stderr. `list`, `status`,
-  `wait` and `questions` take --json.
+  `wait`, `questions`, `messages` and `watch` take --json.
 
     0    success (wait: every session is idle)
     1    error
@@ -277,6 +278,42 @@ enum Command {
     Last {
         #[command(flatten)]
         session: One,
+    },
+    /// List the messages sent to a session, with claude's reply to each
+    ///
+    /// Prints every message sent to claude, whether it's the first prompt, a
+    /// `send` or something typed into the terminal, with how long claude
+    /// worked on it and its final reply. Tool calls, claude's working notes
+    /// and local slash commands such as `/model` are left out. The messages
+    /// come from Claude Code's transcript of the session.
+    ///
+    /// With --json, prints an array of message records: index (from 1),
+    /// session, request, requested_at (Unix seconds), duration_ms, done
+    /// (false while claude is still working on it) and response (claude's
+    /// final reply, null until it has said something).
+    #[command(alias = "history")]
+    Messages {
+        #[command(flatten)]
+        session: One,
+        /// Print the messages as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print each new message once claude has replied to it
+    ///
+    /// Waits for claude to finish each message and prints it like `messages`
+    /// does, until interrupted. Messages that were finished before `watch`
+    /// started aren't printed. A session that `/clear`s is followed to its
+    /// new session. Stops when every watched session has been removed.
+    ///
+    /// With --json, prints one message record per line (fields as in
+    /// `messages --json`).
+    Watch {
+        #[command(flatten)]
+        sessions: Many,
+        /// Print each message as a line of JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Print what's on a session's screen
     ///
@@ -615,6 +652,38 @@ async fn run(command: Command) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Messages { session, json } => {
+            let id = pick(session, Offer::All, "Show the messages of which session?").await?;
+            let s = get_session(&id).await?;
+            let messages = read_messages(&s).await?;
+            if json {
+                let rows: Vec<MessageRow> = messages
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, message)| MessageRow::new(&s.id, i, message))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if messages.is_empty() {
+                eprintln!("no messages in session {} yet", s.short_id());
+            } else {
+                for (i, m) in messages.iter().enumerate() {
+                    if i > 0 {
+                        println!();
+                    }
+                    print_message(None, i, m);
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Watch { sessions, json } => {
+            let ids = select::many(
+                &list_sessions().await?,
+                &sessions.sessions,
+                Offer::Running,
+                "Watch which sessions?",
+            )?;
+            watch_cmd(ids, json).await
+        }
         Command::Peek { session, ansi } => {
             let id = pick(session, Offer::Running, "Peek at which session?").await?;
             let Response::Text { text } = client::request(&Request::Peek { id, ansi }).await?
@@ -851,6 +920,169 @@ async fn wait_cmd(
             ExitCode::SUCCESS
         },
     )
+}
+
+#[derive(Serialize)]
+struct MessageRow<'a> {
+    index: usize,
+    session: &'a str,
+    #[serde(flatten)]
+    message: Message,
+}
+
+impl<'a> MessageRow<'a> {
+    fn new(session: &'a str, i: usize, message: Message) -> Self {
+        MessageRow {
+            index: i + 1,
+            session,
+            message,
+        }
+    }
+}
+
+/// A session's transcript, or nothing when claude hasn't written one yet.
+async fn read_transcript(s: &SessionInfo, from: u64) -> Result<Vec<u8>> {
+    let Some(path) = hooks::transcript_path(&s.cwd, &s.id) else {
+        return Ok(Vec::new());
+    };
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    file.seek(std::io::SeekFrom::Start(from)).await?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes)
+}
+
+async fn read_messages(s: &SessionInfo) -> Result<Vec<Message>> {
+    let mut transcript = Transcript::default();
+    transcript.feed(&read_transcript(s, 0).await?);
+    Ok(transcript.messages(Some(s)))
+}
+
+/// `#3  5m ago · worked 2m 14s`, the request quoted, then the reply.
+fn print_message(session: Option<&str>, i: usize, m: &Message) {
+    let label = session.map(|id| format!("{id}  ")).unwrap_or_default();
+    let duration = format_duration(m.duration_ms);
+    let worked = if m.done {
+        format!("worked {duration}")
+    } else {
+        format!("working for {duration}…")
+    };
+    println!("#{}  {label}{} ago · {worked}", i + 1, ago(m.requested_at));
+    for line in m.request.trim_end().lines() {
+        println!("> {line}");
+    }
+    match &m.response {
+        Some(reply) => {
+            println!();
+            println!("{}", reply.trim_end());
+        }
+        None if m.done => {
+            println!();
+            println!("(no reply)");
+        }
+        None => {}
+    }
+}
+
+/// One session `watch` follows, and how far through its transcript it is.
+struct Watched {
+    id: String,
+    transcript: Transcript,
+    offset: u64,
+    /// Messages already printed, or finished before watching began.
+    printed: usize,
+    /// Claude had finished its turn at the last look.
+    settled: bool,
+    /// Past the first look, which only notes what was already finished.
+    started: bool,
+}
+
+impl Watched {
+    fn new(id: String, started: bool) -> Self {
+        Watched {
+            id,
+            transcript: Transcript::default(),
+            offset: 0,
+            printed: 0,
+            settled: false,
+            started,
+        }
+    }
+
+    /// Takes in what claude has written since the last look; true if anything.
+    async fn read(&mut self, s: &SessionInfo) -> Result<bool> {
+        let bytes = read_transcript(s, self.offset).await?;
+        self.offset += bytes.len() as u64;
+        self.transcript.feed(&bytes);
+        Ok(!bytes.is_empty())
+    }
+}
+
+async fn watch_cmd(ids: Vec<String>, json: bool) -> Result<ExitCode> {
+    let multi = ids.len() > 1;
+    let mut watched: Vec<Watched> = ids.into_iter().map(|id| Watched::new(id, false)).collect();
+    let mut printed_any = false;
+    loop {
+        let sessions = list_sessions().await?;
+        let mut next = Vec::with_capacity(watched.len());
+        for mut w in watched {
+            let Some(s) = sessions.iter().find(|s| s.id == w.id) else {
+                eprintln!("claude-mux: session {} was removed", short_id(&w.id));
+                continue;
+            };
+            let grew = w.read(s).await?;
+            let settled = messages::turn_finished(s);
+            // A prompt can reach the transcript a moment before the session
+            // reports that claude is working on it, so the last message only
+            // counts as done once claude has stayed finished across two looks
+            // with nothing new written.
+            let finished = !w.started || (settled && w.settled && !grew);
+            let msgs = w.transcript.messages(finished.then_some(s));
+            let done = msgs.iter().take_while(|m| m.done).count();
+            if !w.started {
+                w.printed = done;
+            }
+            for (i, m) in msgs.iter().enumerate().take(done).skip(w.printed) {
+                if json {
+                    let row = MessageRow::new(&w.id, i, m.clone());
+                    println!("{}", serde_json::to_string(&row)?);
+                } else {
+                    if printed_any {
+                        println!();
+                    }
+                    print_message(multi.then(|| short_id(&w.id)), i, m);
+                }
+                printed_any = true;
+            }
+            w.printed = w.printed.max(done);
+            w.settled = settled;
+            if let Some(successor) = &s.continued_as
+                && s.status == Status::Stopped
+                && w.printed == msgs.len()
+            {
+                eprintln!(
+                    "claude-mux: {} was cleared; watching {} instead",
+                    s.short_id(),
+                    short_id(successor)
+                );
+                next.push(Watched::new(successor.clone(), w.started));
+                continue;
+            }
+            w.started = true;
+            next.push(w);
+        }
+        watched = next;
+        if watched.is_empty() {
+            return Ok(ExitCode::SUCCESS);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

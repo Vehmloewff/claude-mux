@@ -51,6 +51,8 @@ update it. User-facing commands check GitHub for updates at most once every
 | `wait` | Block until the sessions finish, then print the final reply. |
 | `manage` | Open the TUI. |
 | `list` · `status` · `peek` · `last` | Inspect sessions. |
+| `messages` | List the messages sent to a session, how long claude worked on each, and its reply. |
+| `watch` | Print each new message once claude has replied to it. |
 | `questions` | List and answer questions a session is waiting on. |
 | `keys KEY…` | Press keys in a session, such as `down enter`. |
 | `kill` · `resume` · `rm` · `describe` | Manage sessions. |
