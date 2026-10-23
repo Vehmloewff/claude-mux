@@ -2,7 +2,7 @@
 //!
 //! Every message is a single line of JSON. Most connections are a single
 //! request followed by a single response; `Subscribe` turns the connection
-//! into a bidirectional stream used by `claude-mux manage`.
+//! into a bidirectional stream used by `claude-mux attach`.
 
 use serde::{Deserialize, Serialize};
 
@@ -243,7 +243,7 @@ pub enum Response {
     },
 }
 
-/// Messages a subscribed client (`manage`) sends to the daemon.
+/// Messages a subscribed client (`attach`) sends to the daemon.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {

@@ -2,10 +2,10 @@
 
 Run many Claude Code sessions at once, and drive them from anywhere.
 
-claude-mux keeps your `claude` sessions running in a background daemon. You
-can watch and steer all of them from one TUI. Scripts, and other Claude
-sessions, can start them, send them work and wait for the result from the
-command line.
+claude-mux keeps your `claude` sessions running in a background daemon.
+Attach to any of them to type into it. Scripts, and other Claude sessions,
+can start them, send them work and wait for the result from the command
+line.
 
 - **Real sessions.** Each one is the normal interactive `claude` in its own
   terminal, not a stripped-down API wrapper. Attach at any time and keep
@@ -19,14 +19,14 @@ command line.
   tasks. claude-mux doesn't guess from the screen.
 - **Cheap when idle.** Idle sessions are put to sleep to free memory and
   resumed automatically when you send them something.
-- **Durable.** Sessions outlive the TUI and survive daemon restarts, so you
-  can resume them later.
+- **Durable.** Sessions outlive the commands that start them and survive
+  daemon restarts, so you can resume them later.
 
 ```sh
 claude-mux create "Fix the login redirect bug" -d "Login bug"   # prints the session's id
 claude-mux send -s 3f9a "Also add a regression test"            # any unique prefix of the id works
 claude-mux wait                                                 # no -s: pick sessions from a list
-claude-mux manage                                               # open the TUI
+claude-mux attach -s 3f9a                                       # type into it; ctrl-esc detaches
 ```
 
 ## Install
@@ -49,7 +49,7 @@ update it. User-facing commands check GitHub for updates at most once every
 | `create [PROMPT]` | Start a session and print its id. |
 | `send MESSAGE` | Send a message. It's queued until the session is idle. |
 | `wait` | Block until the sessions finish, then print the final reply. |
-| `manage` | Open the TUI. |
+| `attach` | Type into a session's terminal. `ctrl-esc` detaches. |
 | `list` · `status` · `peek` · `last` | Inspect sessions. |
 | `messages` | List the messages sent to a session, how long claude worked on each, and its reply. |
 | `watch` | Print each new message once claude has replied to it. |
@@ -72,9 +72,9 @@ and points to its successor. It can still be resumed.
 Run `claude-mux --help` for every flag. It covers everything an agent needs
 to drive claude-mux.
 
-In the TUI, use `j`/`k` to pick a session, `enter` to type into it,
-`ctrl-]` to go back to the list, `n` for a new session and `?` for every key.
-Quitting the TUI leaves your sessions running.
+`attach` shows the session's claude full screen. Press `ctrl-esc` to detach
+and leave it running. Terminals that can't report `ctrl-esc` (those without
+the kitty keyboard protocol, such as Terminal.app) take `ctrl-]` instead.
 
 ## How it works
 

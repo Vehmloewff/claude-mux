@@ -1,5 +1,5 @@
 //! The claude-mux daemon: owns every claude process, its PTY and its
-//! terminal emulator, and serves the CLI / TUI over a Unix socket.
+//! terminal emulator, and serves the CLI over a Unix socket.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
@@ -106,6 +106,8 @@ struct Session {
     draft_at: Option<Instant>,
     /// The process is being stopped to put the session to sleep.
     falling_asleep: bool,
+    /// Clients attached to the terminal; an attached session stays awake.
+    attached: usize,
     /// Keys and pastes that arrived while asleep, typed once claude is back.
     wake_input: Vec<WakeInput>,
     /// Whether claude has a saved conversation that `--resume` can load
@@ -139,6 +141,7 @@ impl Session {
             idle_since: None,
             draft_at: None,
             falling_asleep: false,
+            attached: 0,
             wake_input: Vec::new(),
         }
     }
@@ -164,6 +167,7 @@ impl Session {
             && self.screen_prompt.is_none()
             && self.background_cleared.is_none()
             && self.draft_at.is_none_or(|t| t.elapsed() > DRAFT_GRACE)
+            && self.attached == 0
     }
 }
 
@@ -1492,7 +1496,7 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Live streaming for `claude-mux manage`
+// Live streaming for `claude-mux attach`
 
 #[derive(Clone, Default)]
 struct Watch {
@@ -1521,6 +1525,12 @@ async fn subscribe(
                 client_event(&d, &watch, ev).await;
             }
             alive.store(false, Ordering::SeqCst);
+            let watched = watch.lock().unwrap().id.take();
+            if let Some(id) = watched
+                && let Some(s) = d.lock().await.sessions.get_mut(&id)
+            {
+                s.attached = s.attached.saturating_sub(1);
+            }
             d.poke_watchers();
         });
     }
@@ -1598,25 +1608,33 @@ async fn term_of(d: &Shared, id: &str) -> Option<TermHandle> {
 async fn client_event(d: &Shared, watch: &Mutex<Watch>, ev: ClientEvent) {
     match ev {
         ClientEvent::Watch { id, cols, rows } => {
-            if let Some(id) = &id {
-                let mut inner = d.lock().await;
-                if let Some(s) = inner.sessions.get_mut(id)
-                    && cols > 0
-                    && rows > 0
-                    && s.size != (cols, rows)
-                {
-                    s.size = (cols, rows);
-                    if let Some(p) = &s.proc {
-                        let _ = p.master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
-                    }
-                    if let Some(t) = &s.term {
-                        t.resize(cols, rows);
-                    }
+            let mut inner = d.lock().await;
+            let previous = watch.lock().unwrap().id.clone();
+            if previous != id {
+                if let Some(s) = previous.and_then(|p| inner.sessions.get_mut(&p)) {
+                    s.attached = s.attached.saturating_sub(1);
+                }
+                if let Some(s) = id.as_ref().and_then(|i| inner.sessions.get_mut(i)) {
+                    s.attached += 1;
+                }
+            }
+            if let Some(id) = &id
+                && let Some(s) = inner.sessions.get_mut(id)
+                && cols > 0
+                && rows > 0
+                && s.size != (cols, rows)
+            {
+                s.size = (cols, rows);
+                if let Some(p) = &s.proc {
+                    let _ = p.master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+                if let Some(t) = &s.term {
+                    t.resize(cols, rows);
                 }
             }
             let mut w = watch.lock().unwrap();

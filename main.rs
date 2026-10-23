@@ -1,17 +1,20 @@
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::sync::mpsc;
 
 use claude_mux::messages::{self, Message, Transcript, format_duration};
 use claude_mux::paths;
 use claude_mux::protocol::{
-    self, CreateRequest, KeyInput, Request, Response, SessionInfo, Status, short_id,
+    self, CreateRequest, KeyInput, Request, Response, SessionInfo, Status, StreamEvent, short_id,
 };
 use claude_mux::term::{Dialog, parse_dialog};
-use claude_mux::{ago, client, hooks, manage, short_path, upgrade};
+use claude_mux::{ago, attach, client, hooks, short_path, upgrade};
 
 mod select;
 use select::Offer;
@@ -20,8 +23,8 @@ use select::Offer;
 #[command(
     name = "claude-mux",
     version,
-    about = "Run many Claude Code sessions in the background and drive them from scripts, agents or a TUI",
-    long_about = "Run many Claude Code sessions in the background and drive them from scripts, agents or a TUI.\n\n\
+    about = "Run many Claude Code sessions in the background and drive them from scripts or agents",
+    long_about = "Run many Claude Code sessions in the background and drive them from scripts or agents.\n\n\
 Each session is a real interactive `claude` in a terminal owned by the claude-mux daemon, which starts \
 by itself when a command needs it. Sessions keep running after the command that started them exits.",
     after_help = "Run `claude-mux --help` for how sessions work, exit codes and the environment.\n\
@@ -38,7 +41,7 @@ QUICK START
   id=$(claude-mux create \"Fix the flaky test in tests/auth_test.go\" -C ~/repo)
   claude-mux wait -s \"$id\"                # blocks until claude is done; prints its reply
   claude-mux send -s \"$id\" \"Add a regression test\" --wait
-  claude-mux manage                       # watch and type into every session
+  claude-mux attach -s \"$id\"              # type into the session; ctrl-esc detaches
 
   A new session knows nothing about the caller. Write the prompt like a
   ticket: the goal, where to look, and how to tell when it's done.
@@ -143,8 +146,8 @@ enum Command {
         /// First message for claude; '-' reads it from stdin. Without one,
         /// claude starts idle, waiting for `send`
         prompt: Option<String>,
-        /// What the session is for; labels it in `list`, `manage` and the
-        /// session picker (default: the prompt's first line)
+        /// What the session is for; labels it in `list` and the session
+        /// picker (default: the prompt's first line)
         #[arg(long, short)]
         description: Option<String>,
         /// Directory to run claude in (default: the current directory)
@@ -343,8 +346,7 @@ enum Command {
     },
     /// Set or clear a session's description
     ///
-    /// The description labels the session in `list`, `manage` and the session
-    /// picker. Without one, the prompt's first line is used.
+    /// The description labels the session in `list` and the session picker. Without one, the prompt's first line is used.
     Describe {
         /// New description
         #[arg(required_unless_present = "clear", conflicts_with = "clear")]
@@ -375,22 +377,12 @@ enum Command {
         #[command(flatten)]
         sessions: Many,
     },
-    /// Open the TUI to watch and drive every session
+    /// Type into a session's terminal; ctrl-esc detaches
     ///
-    /// Lists sessions beside the selected one's live terminal. In the list:
-    /// j/k move, 1-9 jump, enter types into the terminal, n new, s send, x
-    /// kill, r resume, d delete, R describe, pgup/pgdn scroll, ? all keys, q
-    /// quit. While typing into a terminal, ctrl-] returns to the list.
-    /// Quitting leaves every session running.
-    Manage {
-        /// Session to select first: id or unique prefix
-        #[arg(short, long, value_name = "ID")]
-        session: Option<String>,
-    },
-    /// Open the TUI typing into one session's terminal
-    ///
-    /// Same as `manage`, starting with the session's terminal focused. ctrl-]
-    /// returns to the list.
+    /// Shows the session's claude full screen, and every key goes to it. The
+    /// mouse wheel scrolls back. Press ctrl-esc to detach, which leaves the
+    /// session running; terminals that can't report ctrl-esc take ctrl-]
+    /// instead. A sleeping session wakes up, and stays awake while attached.
     Attach {
         #[command(flatten)]
         session: One,
@@ -614,21 +606,21 @@ async fn run(command: Command) -> Result<ExitCode> {
             )?;
             wait_cmd(ids, any, timeout, turn, quiet, json).await
         }
-        Command::Manage { session } => {
-            let id = match session {
-                Some(q) => Some(select::one(
-                    &list_sessions().await?,
-                    Some(&q),
-                    Offer::All,
-                    "Select which session?",
-                )?),
-                None => None,
-            };
-            manage::run(id, false).await.map(|_| ExitCode::SUCCESS)
-        }
         Command::Attach { session } => {
+            use std::io::IsTerminal;
             let id = pick(session, Offer::Running, "Attach to which session?").await?;
-            manage::run(Some(id), true).await.map(|_| ExitCode::SUCCESS)
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                bail!("attach needs a terminal");
+            }
+            if get_session(&id).await?.asleep {
+                client::request(&Request::Resume { id: id.clone() }).await?;
+            }
+            let detach = attach::run(id).await?;
+            eprintln!("claude-mux: {}", detach.message());
+            Ok(match detach {
+                attach::Detach::Disconnected => ExitCode::FAILURE,
+                _ => ExitCode::SUCCESS,
+            })
         }
         Command::List { json } => {
             let sessions = list_sessions().await?;
@@ -997,8 +989,8 @@ struct Watched {
     offset: u64,
     /// Messages already printed, or finished before watching began.
     printed: usize,
-    /// Claude had finished its turn at the last look.
-    settled: bool,
+    /// Since when claude has had its turn finished with nothing new written.
+    quiet_since: Option<Instant>,
     /// Past the first look, which only notes what was already finished.
     started: bool,
 }
@@ -1010,7 +1002,7 @@ impl Watched {
             transcript: Transcript::default(),
             offset: 0,
             printed: 0,
-            settled: false,
+            quiet_since: None,
             started,
         }
     }
@@ -1024,26 +1016,103 @@ impl Watched {
     }
 }
 
+/// A prompt can reach the transcript a moment before the session reports
+/// that claude is working on it, so the last message only counts as done
+/// once claude's turn has been over this long with nothing new written.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// Session lists pushed by the daemon whenever any session changes.
+async fn subscribe_sessions() -> Result<mpsc::UnboundedReceiver<Vec<SessionInfo>>> {
+    let mut conn = client::connect().await?;
+    conn.send(&Request::Subscribe).await?;
+    let (reader, writer) = conn.into_split();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        // The daemon ends the stream when this side closes, so keep it open.
+        let _writer = writer;
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(StreamEvent::Sessions { sessions }) = serde_json::from_str(&line)
+                && tx.send(sessions).is_err()
+            {
+                return;
+            }
+        }
+    });
+    Ok(rx)
+}
+
+/// Watches the directories transcripts are written to. A transcript's
+/// directory appears when claude first writes there, so until then its
+/// parent is watched for it.
+struct TranscriptDirs {
+    watcher: notify::RecommendedWatcher,
+    watched: std::collections::HashSet<PathBuf>,
+}
+
+impl TranscriptDirs {
+    fn new(changed: mpsc::UnboundedSender<()>) -> Result<Self> {
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if event.is_ok() {
+                let _ = changed.send(());
+            }
+        })
+        .context("watching transcripts")?;
+        Ok(TranscriptDirs {
+            watcher,
+            watched: Default::default(),
+        })
+    }
+
+    fn cover(&mut self, s: &SessionInfo) -> Result<()> {
+        use notify::Watcher;
+        let Some(dir) = hooks::transcript_path(&s.cwd, &s.id).and_then(|p| {
+            p.ancestors()
+                .skip(1)
+                .find(|dir| dir.is_dir())
+                .map(Path::to_path_buf)
+        }) else {
+            return Ok(());
+        };
+        if !self.watched.contains(&dir) {
+            self.watcher
+                .watch(&dir, notify::RecursiveMode::NonRecursive)
+                .with_context(|| format!("watching {}", dir.display()))?;
+            self.watched.insert(dir);
+        }
+        Ok(())
+    }
+}
+
 async fn watch_cmd(ids: Vec<String>, json: bool) -> Result<ExitCode> {
     let multi = ids.len() > 1;
     let mut watched: Vec<Watched> = ids.into_iter().map(|id| Watched::new(id, false)).collect();
     let mut printed_any = false;
+    let (changed_tx, mut changed) = mpsc::unbounded_channel();
+    let mut dirs = TranscriptDirs::new(changed_tx)?;
+    let mut updates = subscribe_sessions().await?;
+    let mut sessions = updates
+        .recv()
+        .await
+        .context("lost connection to the daemon")?;
     loop {
-        let sessions = list_sessions().await?;
+        let now = Instant::now();
+        let mut wake_at: Option<Instant> = None;
         let mut next = Vec::with_capacity(watched.len());
         for mut w in watched {
             let Some(s) = sessions.iter().find(|s| s.id == w.id) else {
                 eprintln!("claude-mux: session {} was removed", short_id(&w.id));
                 continue;
             };
+            dirs.cover(s)?;
             let grew = w.read(s).await?;
-            let settled = messages::turn_finished(s);
-            // A prompt can reach the transcript a moment before the session
-            // reports that claude is working on it, so the last message only
-            // counts as done once claude has stayed finished across two looks
-            // with nothing new written.
-            let finished = !w.started || (settled && w.settled && !grew);
-            let msgs = w.transcript.messages(finished.then_some(s));
+            if !messages::turn_finished(s) {
+                w.quiet_since = None;
+            } else if grew || w.quiet_since.is_none() {
+                w.quiet_since = Some(now);
+            }
+            let quiet = w.quiet_since.is_some_and(|t| now >= t + QUIET);
+            let msgs = w.transcript.messages((!w.started || quiet).then_some(s));
             let done = msgs.iter().take_while(|m| m.done).count();
             if !w.started {
                 w.printed = done;
@@ -1061,7 +1130,13 @@ async fn watch_cmd(ids: Vec<String>, json: bool) -> Result<ExitCode> {
                 printed_any = true;
             }
             w.printed = w.printed.max(done);
-            w.settled = settled;
+            if let Some(t) = w.quiet_since
+                && !quiet
+                && w.printed < msgs.len()
+            {
+                let at = t + QUIET;
+                wake_at = Some(wake_at.map_or(at, |w| w.min(at)));
+            }
             if let Some(successor) = &s.continued_as
                 && s.status == Status::Stopped
                 && w.printed == msgs.len()
@@ -1081,7 +1156,15 @@ async fn watch_cmd(ids: Vec<String>, json: bool) -> Result<ExitCode> {
         if watched.is_empty() {
             return Ok(ExitCode::SUCCESS);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Sleep until a transcript changes, a session does, or the last
+        // message has been quiet long enough to count as done.
+        tokio::select! {
+            update = updates.recv() => {
+                sessions = update.context("lost connection to the daemon")?;
+            }
+            _ = changed.recv() => while changed.try_recv().is_ok() {},
+            _ = tokio::time::sleep_until(wake_at.unwrap_or(now).into()), if wake_at.is_some() => {}
+        }
     }
 }
 

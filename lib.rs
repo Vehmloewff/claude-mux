@@ -2,11 +2,11 @@
 //!
 //! Shared by the `claude-mux` CLI and its daemon (`claude-mux daemon`).
 
+pub mod attach;
 pub mod client;
 pub mod daemon;
 pub mod db;
 pub mod hooks;
-pub mod manage;
 pub mod messages;
 pub mod paths;
 pub mod protocol;
